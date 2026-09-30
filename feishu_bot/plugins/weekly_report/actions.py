@@ -36,7 +36,6 @@ DEFAULT_RULES = {
     "excess_min_units": 20,          # 冗余/库龄风险/亚马逊冗余>=此件数才列清货候选；本地滞销>=此件数才列停采/清仓
     "aged_fee_urgent_units": 5,      # aged_fee_urgent_days(默认90天)内就会过收费线(服装271天)的件数>=此值 → 清货P1(紧急)；否则P2(预警)
     "po_reduce_min_units": 10,
-    "price_gap_check": 0.05,         # 实际售价(促销价优先)比竞品最低价高>=5% 才列核价候选
     "price_floor_tol": 0.02,
     "monitor_p0_days": 90,           # 零销量/停售库存 距库龄收费线<=90天 → P0；<=150天 → P1；更远 → P2         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)
     "block_stock_days": 21,          # 含在途天数<21 不加投(提示词硬性规则3)
@@ -58,7 +57,7 @@ TYPE_INFO = {   # 类型: (ID前缀, 中文名, 执行方式)
     "INV_CLEAR": ("XC", "冗余清货(优惠券/秒杀/降价，不低于保本价)", "人工(需确认)"),
     "PO_REDUCE": ("XP", "削减/延后待交付PO", "人工"),
     "LOCAL_SLOW": ("XL", "本地仓滞销尺码：停止采购/清仓", "人工"),
-    "PRICE_CHECK": ("PC", "核价：实际售价高于竞品最低价", "人工"),
+    "PRICE_CHECK": ("PC", "同ASIN有更低报价：查跟卖", "人工"),
     "MON_NO_SALE": ("MN", "零销量排查：到FBA满30天仍0单", "人工"),
     "MON_INACTIVE": ("MI", "停售子体仍有FBA库存：重新激活或移除", "人工"),
     "MON_CLIFF": ("MC", "销量断崖排查(有货却连续14天0单)", "人工"),
@@ -271,11 +270,12 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
                 add("PRICE_FLOOR", key, 对象="促销中的尺码", 单位="个SKU", 当前值=len(below), 建议值=None, 规则优先级="P1", _rank=6e3 + len(below), 父体概况=ctx,
                     依据=f"促销价低于保本价{be_p:.2f}(不含广告与仓储费)：" + "、".join(f"{m_} {v_:.2f}" for m_, v_ in below[:10]) +
                          "；若是有意清滞销/冗余尺码可保留，否则上调促销价或结束促销")
-        gap = _f(r.get("SP_价格高于竞品最低价比例"))
-        if gap is not None and gap >= R["price_gap_check"]:
-            add("PRICE_CHECK", key, 对象="价格", 单位="%", 当前值=round(gap * 100, 1), 建议值=None, 规则优先级="P2", _rank=2e3 + gap, 父体概况=ctx,
-                依据=f"实际售价(促销价优先){_f(r.get('SP_我方实际售价')) or 0:.2f} 比竞品最低价{_f(r.get('SP_竞品最低价')) or 0:.2f} 高{gap:.1%}；"
-                     f"全站转化率{_f(r.get('全站转化率')) or 0:.1%}；核对竞品是否同款同规格后再决定是否调价(不得低于保本价)")
+        under = _f(r.get("SP_同ASIN更低报价SKU数")) or 0
+        if under > 0:
+            add("PRICE_CHECK", key, 对象="同ASIN报价", 单位="个SKU", 当前值=under, 建议值=None, 规则优先级="P1", _rank=2e3 + under, 父体概况=ctx,
+                依据=f"{under:.0f}个子体在同一ASIN上出现低于我方促销价/标价的报价(我方实际售价均值{_f(r.get('SP_我方实际售价')) or 0:.2f}，"
+                     f"同ASIN最低报价均值{_f(r.get('SP_同ASIN最低报价')) or 0:.2f}，Buy Box {(_f(r.get('SP_BuyBox占比')) or 0):.1%})；"
+                     "在前台查看'其他卖家'：是跟卖就投诉/发警告信，是我方另一个报价就统一价格")
         po_cut = _f(r.get("冗余_可削减PO件数")) or 0
         if po_cut >= R["po_reduce_min_units"]:
             add("PO_REDUCE", key, 对象="待交付PO中冗余的尺码", 单位="件", 当前值=_f(r.get("待交付")) or 0, 建议值=round(po_cut),
@@ -632,7 +632,18 @@ def validate(sel, cands, cfg=None):
                             "原因": f"{hit[0]} 被规则阻止加投({stopped[hit[0]][:60]}…)，人工事项不能绕过"})
         else:
             keep_m.append(m)
-    return {"passed": keep, "blocked": blocked, "manual": keep_m}
+    # 人工事项里不能放候选(候选要么进执行清单，要么在九写暂缓原因)，否则绕过了校验和条数上限
+    ids = {c["id"] for c in cands}
+    keep_m2 = []
+    for m in keep_m:
+        txt = f"{m.get('对象', '')} {m.get('动作', '')} {m.get('理由', '')}"
+        hit = [i for i in re.findall(r"(?<![A-Za-z0-9])([A-Z]{2}\d{2})(?!\d)", txt) if i in ids]
+        if hit:
+            blocked.append({"id": "人工事项", "对象": m.get("对象", ""), "理由": m.get("理由", ""), "状态": "拦截",
+                            "原因": f"{'、'.join(hit)} 是候选，要么放进执行清单，要么在九说明暂缓原因，不能放人工事项"})
+        else:
+            keep_m2.append(m)
+    return {"passed": keep, "blocked": blocked, "manual": keep_m2}
 
 
 def _action_txt(x):
@@ -702,8 +713,21 @@ LINT_METRICS = {   # 关键词 -> 父体表里可作为出处的字段(单父体
     "冗余": ["冗余_FBA件数", "冗余_总件数", "亚马逊冗余件数"],
     "不足": ["尺码_本地仓不足件数", "尺码_空运本地不足件数"],
     "滞销": ["滞销_FBA件数", "滞销_本地件数"],
+    "收费线": ["库龄_卖出前将满收费线件数", "库龄_近期过收费线件数"],
 }
 _LOCAL_OK = re.compile(r"本地仓[^。；\n]{0,12}(充足|足够|够用)|无需(新增)?(新)?采购|不需要新增采购|暂不需要新增采购|直接(空运|海运)?调拨[^。；\n]{0,8}避免断货")
+
+
+def _which_col(P, n_, exclude=()):
+    """数字 n_ 等于父体表哪一列的单父体值或全部合计(用于提示 AI 把哪一列读错了)"""
+    for col in P.columns:
+        if col in exclude or not any(k in str(col) for k in ("件数", "库龄", "冗余", "缺", "滞销", "可售", "在途", "待交付")):
+            continue
+        v = pd.to_numeric(P[col], errors="coerce").dropna()
+        v = v[v > 0]
+        if len(v) and (any(abs(n_ - x) < 0.5 for x in v) or abs(n_ - v.sum()) < 0.5):
+            return col
+    return None
 
 
 def lint_report(text, P):
@@ -782,7 +806,9 @@ def lint_report(text, P):
             if any(abs(n_ - v) <= 1 for v in singles[kw]) or any(abs(n_ - t) <= max(2, 0.05 * t) for t in totals[kw]):
                 continue
             snip = c[max(0, m.start() - 30):m.end() + 10].strip()
-            issues.append(f"「…{snip}…」里的 {n_} 件在数据包的'{kw}'相关字段里找不到出处")
+            other = _which_col(P, n_, exclude=LINT_METRICS[kw])
+            issues.append(f"「…{snip}…」里的 {n_} 件在数据包的'{kw}'相关字段里找不到出处" +
+                          (f"(它等于'{other}'，口径不同，不能当{kw}件数)" if other else ""))
     out, seen = [], set()
     for x in issues:
         if x not in seen:
