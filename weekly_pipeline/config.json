@@ -1,0 +1,80 @@
+{
+  "db_path": "data/weekly.db",
+  "out_dir": "out",
+  "exclude_countries": [
+    "CA",
+    "MX",
+    "BR"
+  ],
+  "cny_per_usd": 6.7,
+  "fx_to_usd": {
+    "USD": 1.0,
+    "CAD": 0.72,
+    "MXN": 0.055,
+    "GBP": 1.3,
+    "BRL": 0.18,
+    "EUR": 1.1,
+    "JPY": 0.0067,
+    "AUD": 0.65
+  },
+  "freight_usd_per_unit_default": null,
+  "freight_placeholder_max": 0.05,
+  "freight_by_style_csv": "",
+  "attribution_lag_days": 3,
+  "new_product_days": 60,
+  "stock_low_days": 21,
+  "stock_high_days": 120,
+  "sample_orders_low": 5,
+  "sample_orders_high": 15,
+  "min_clicks_waste": 8,
+  "top_n": {
+    "waste": 12,
+    "winners": 12,
+    "keywords": 10,
+    "detail_parents": 15,
+    "sqp": 10
+  },
+  "prompt_file": "",
+  "spapi_enabled": true,
+  "spapi_credential_file": "",
+  "spapi_accounts": {
+    "tangliuquan": "亚马逊sp-api.txt",
+    "xupeng": "亚马逊sp-api-xupeng.txt"
+  },
+  "spapi_single_account": "",
+  "spapi_poll_seconds": 15,
+  "spapi_report_timeout_seconds": 600,
+  "spapi_heartbeat_seconds": 30,
+  "spapi_total_timeout_seconds": 2400,
+  "spapi_sqp_countries": [
+    "US"
+  ],
+  "spapi_throttle_sleep_seconds": 65,
+  "spapi_api_retries": 5,
+  "spapi_cache_dir": "data/spapi_cache",
+  "spapi_refresh": false,
+  "spapi_fetch_sales_traffic": true,
+  "spapi_sales_history_weeks": 1,
+  "spapi_fetch_returns": true,
+  "spapi_fetch_planning": true,
+  "spapi_fetch_search_catalog": false,
+  "spapi_search_catalog_countries": [
+    "US",
+    "UK"
+  ],
+  "spapi_fetch_sqp": false,
+  "spapi_sqp_max_asins": 54,
+  "spapi_sqp_asins_per_parent": 3,
+  "sales_source": "auto",
+  "week_end_default": "last_saturday",
+  "spapi_sqp_lag_days": 2,
+  "spapi_window_lag_days": 0,
+  "receiving_avail_days": 10,
+  "replen_cycle_days": 10,
+  "safety_stock_days": 10,
+  "local_ship_prep_days": 2,
+  "spapi_skip_countries": [
+    "UK"
+  ],
+  "spapi_allow_duplicate_store_aliases": false
+}
