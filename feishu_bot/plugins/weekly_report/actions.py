@@ -233,8 +233,9 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
                     low = f"；亚马逊建议价最低{min(ps):.2f}低于保本价{be_p:.2f}，不宜照做"
             add("INV_CLEAR", key, 对象="冗余尺码", 单位="件", 当前值=0, 建议值=q, 允许范围=[math.ceil(q * 0.5), math.ceil(q * 1.2)],
                 规则优先级="P1" if (a181 > 0 or sto >= 50) else "P2", _rank=5e3 + q, 父体概况=ctx,
-                依据=f"FBA冗余{exf:.0f}件(超{int((cfg or {}).get('excess_fba_days', 90))}天销量)：{(r.get('冗余_FBA明细') or '-')[:160]}；亚马逊估算冗余{amz:.0f}件；"
-                     f"冗余尺码下月预估仓储费${sto:.0f}{low}"
+                依据=f"FBA在库冗余{exf:.0f}件(超{int((cfg or {}).get('excess_fba_days', 90))}天销量，不含在途)：{(r.get('冗余_FBA明细') or '-')[:160]}；亚马逊估算冗余{amz:.0f}件；"
+                     f"冗余部分下月仓储费约${sto:.0f}(按冗余件数分摊)"
+                     + (f"；在途到货后再增加冗余{_f(r.get('冗余_在途将增加件数')):.0f}件，这些尺码可暂停发货" if (_f(r.get('冗余_在途将增加件数')) or 0) >= 5 else "") + low
                      + (f"；已有{len(pp)}个尺码在促销(最低{min(v_ for _, v_ in pp):.2f})，先看促销效果再加码" if pp else "") + "；促销价不得低于保本价")
         promo = r.get("促销价明细") or ""
         pp = [(m_, float(v_)) for m_, v_ in re.findall(r"([^、\s]+) ([\d.]+)", promo)]
@@ -676,16 +677,20 @@ def lint_report(text, P):
         if kw == "待上架" and "尺码_当前断码" in P.columns:      # 主力断码里的'已到仓N件待上架'
             for t_ in P["尺码_当前断码"].dropna().astype(str):
                 sv |= {int(x) for x in re.findall(r"已到仓(\d+)件", t_)}
-        singles[kw], totals[kw] = sv, [t for t in tv if t > 0]
+        for dc in [c for c in P.columns if str(c).endswith("明细") and any(k in str(c) for k in ("冗余", "滞销", "缺", "不足", "尺码"))]:
+            for t_ in P[dc].dropna().astype(str):          # 尺码级明细里的件数(如 HL-3XL 28)也算有出处
+                sv |= {int(float(x)) for x in re.findall(r" (\d+(?:\.\d+)?)(?:、|$)", t_)}
+        tv = [t for t in tv if t > 0]
+        singles[kw], totals[kw] = sv, tv + [a + b for i, a in enumerate(tv) for b in tv[i + 1:]]   # 两个合计相加(如 FBA+本地)
     kws = "|".join(LINT_METRICS)
     for c in clauses:
-        for m in re.finditer(r"(\d{2,5})\s*件", c):
+        for m in re.finditer(r"(?<![\d,.])(\d{1,3}(?:,\d{3})+|\d{2,5})\s*件", c):
             pre = c[max(0, m.start() - 16):m.start()]
             ks = [(pre.rfind(k), k) for k in LINT_METRICS if k in pre]
             if not ks or re.search(r"[/、()（）]", pre[max(k for k, _ in ks):]):
                 continue                                   # 前面没有关键词，或关键词和数字之间隔着别的对象
             kw = max(ks)[1]
-            n_ = int(m.group(1))
+            n_ = int(m.group(1).replace(",", ""))
             if not singles[kw]:
                 continue
             if any(abs(n_ - v) <= 1 for v in singles[kw]) or any(abs(n_ - t) <= max(2, 0.05 * t) for t in totals[kw]):

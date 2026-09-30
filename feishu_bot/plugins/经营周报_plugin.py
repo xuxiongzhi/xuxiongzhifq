@@ -637,7 +637,8 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
             if "冗余_FBA件数" in P.columns:              # 冗余/滞销：清货与停采
                 ex = P[P["冗余_FBA件数"].fillna(0) >= 20].sort_values("冗余_FBA件数", ascending=False)
                 if len(ex):
-                    lines.append(f"· 冗余(FBA超90天销量)共 {ex['冗余_FBA件数'].sum():.0f} 件：" + "、".join(
+                    lines.append(f"· FBA在库冗余(超90天销量)共 {ex['冗余_FBA件数'].sum():.0f} 件"
+                                 + (f"，冗余部分月仓储费约 ${P['冗余_预估月仓储费'].sum():.0f}" if "冗余_预估月仓储费" in P.columns else "") + "：" + "、".join(
                         f"{r['款']} {r['冗余_FBA件数']:.0f}" for _, r in ex.head(5).iterrows())
                         + (f"；滞销尺码(满45天、近30天零销量) FBA {P['滞销_FBA件数'].sum():.0f} 件、本地仓 {P['滞销_本地件数'].sum():.0f} 件" if "滞销_FBA件数" in P.columns else ""))
             only = P[(P["断货天数_保守"].fillna(0) > 0) & (P["断货天数_含待交付"].fillna(0) == 0)]

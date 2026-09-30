@@ -825,7 +825,9 @@ FIELD_DOC = pd.DataFrame([
     ("建议空运件数_尺码合计/建议海运发货件数_尺码合计", "逐SKU算 空运(撑到海运可售日)/海运(覆盖到可售+发货周期+安全库存)最少件数再求和，明细见 空运尺码明细/海运尺码明细；比父体级更准(尺码之间不能互相顶替)"),
     ("尺码_当前断码数/尺码_当前断码_主力数/尺码_当前断码", "快照日可售为0且日均>=0.1的SKU数；主力=占父体需求>=5%。明细里注明'已到仓N件待上架'(入库中/已签收，按上架天数后可售)还是'无货在途'。按亚马逊规则，可售为0就是断货，到仓未上架也买不到"),
     ("保本价", "(采购成本+头程+FBA费)÷(1−平台费率)：清货促销的价格下限(不含广告与仓储费)；亚马逊建议促销价常低于它"),
-    ("冗余_FBA件数/冗余_总件数", "逐SKU：FBA冗余=FBA可售+在途−日均_预测×excess_fba_days(默认90天)；总冗余=FBA+在途+待交付+本地仓−日均_预测×excess_total_days(默认180天)，零销量SKU全部算冗余；父体为合计，明细见 *_明细"),
+    ("冗余_在途将增加件数", "逐SKU：在途/待上架的货到仓后，会让FBA冗余再增加的件数(还没进FBA，不产生仓储费)；这些尺码的发货可以考虑暂停"),
+    ("冗余_预估月仓储费", "逐SKU：亚马逊下月预估仓储费(只含FBA在库，不含本地仓/在途) × FBA冗余件数 ÷ FBA在库件数(可售+预留)，即冗余那部分件数分摊的仓储费；父体为合计"),
+    ("冗余_FBA件数/冗余_总件数", "逐SKU：FBA冗余=FBA在库可售−日均_预测×excess_fba_days(默认90天)，不含在途；总冗余=FBA+在途+待交付+本地仓−日均_预测×excess_total_days(默认180天)，零销量SKU全部算冗余；父体为合计，明细见 *_明细"),
     ("冗余_可削减PO件数", "逐SKU：待交付中超出总冗余线的部分(=min(待交付, 总冗余))，可与工厂协商减少或延后"),
     ("滞销_SKU数/滞销_FBA件数/滞销_本地件数", "开售且首次到FBA都已>=slow_min_age_days(默认45天)、近30天零销量、有FBA或本地仓库存的SKU；本地仓共享池只在主站行计一次。开售或首次到FBA不足45天、或从没到过FBA(本地未发)的计入 新SKU观察数，不算滞销/冗余"),
     ("亚马逊冗余件数/亚马逊建议促销明细", "库存计划报告：estimated-excess-quantity 合计；recommended-action=Create sale/Lower price 的SKU及亚马逊建议价(常低于保本价，只作参考)"),
@@ -1258,6 +1260,7 @@ def _parse_planning(text, L_store, cfg, fx_default, store=None):
             "亚马逊冗余件数": n("estimated-excess-quantity"), "亚马逊建议": x["recommended-action"] if has("recommended-action") else None,
             "亚马逊建议价": (n("recommended-sales-price") * rate).where(lambda v: v > 0), "预估月仓储费": x["_sto"],
             "标价": x["_your"], "促销价": x["_sale"],
+            "FBA在库": ssum(n("available"), n("Total Reserved Quantity")),     # 仓储费按在库件数(可售+预留)收
             "库存健康": x["fba-inventory-level-health-status"] if has("fba-inventory-level-health-status") else None})
     s = lambda c: (lambda v: v.sum(min_count=1))
     g = x.groupby("_p").agg(SP_库龄90天以上件数=("_a91", s("")), SP_库龄181天以上件数=("_a181", s("")),
@@ -2003,6 +2006,14 @@ def add_forecast(P, replen, cfg, q):
     return P
 
 
+def _f0(v):
+    try:
+        v = float(v)
+        return None if np.isnan(v) else v
+    except (TypeError, ValueError):
+        return None
+
+
 def _sim_short(S0, dmd, arr, snap, H):
     """逐日模拟，返回每天没卖出去的件数(缺口)列表；到仓日按可售日入库"""
     inc = {}
@@ -2069,8 +2080,14 @@ def sku_supply(P, replen, ship, po, snap, cfg, q):
         fba_age = (snap - fr_).days if fr_ is not None else None
         # 新SKU：开售不足N天，或第一次到FBA不足N天(FBA刚有货，30天零销量不代表滞销)；从没到过FBA且没有可售=本地未发，不算滞销
         young = (sage is not None and sage < new_days) or (fba_age is not None and fba_age < new_days) or (fr_ is None and S0 <= 0)
-        ex = {"首次到FBA天数": fba_age, "FBA冗余件数": 0.0 if young else max(0.0, S0 + inb - d * ex_fba), "总冗余件数": 0.0 if young else max(0.0, S0 + inb + pos + pool_own - d * ex_tot),
-              "本地仓计入": pool_own, "开售天数": sage, "新SKU观察": bool(young and (S0 + inb + pool_own) > 0),
+        onhand = _f0(pl.get("FBA在库")) or S0
+        fba_ex = 0.0 if young else max(0.0, S0 - d * ex_fba)                              # 只算FBA在库可售(仓储费只对在库收)
+        inb_ex = 0.0 if young else max(0.0, S0 + inb - d * ex_fba) - fba_ex               # 在途到货后会增加的冗余
+        sto = _f0(pl.get("预估月仓储费"))
+        ex = {"首次到FBA天数": fba_age, "FBA冗余件数": fba_ex, "在途将增加冗余件数": inb_ex,
+              "冗余仓储费": (sto * min(1.0, fba_ex / onhand)) if (sto and onhand > 0) else 0.0, "总冗余件数": 0.0 if young else max(0.0, S0 + inb + pos + pool_own - d * ex_tot),
+              "本地仓计入": pool_own,
+ "开售天数": sage, "新SKU观察": bool(young and (S0 + inb + pool_own) > 0),
               "滞销": bool(not young and (r["30天销量"] or 0) == 0 and (S0 + pool_own) > 0),
               "60天零销量": bool((r["60天销量"] or 0) == 0 and (S0 + pool_own) > 0),
               "FBA库存天数": (S0 + inb) / d if d > 0 else np.nan, "总库存天数": (S0 + inb + pos + pool_own) / d if d > 0 else np.nan,
@@ -2138,6 +2155,7 @@ def sku_supply(P, replen, ship, po, snap, cfg, q):
                     "尺码_本地仓不足件数": float((g["空运本地不足"] + g["海运本地不足"]).sum()),
                     "尺码_本地仓不足明细": detail(g.assign(_n=g["空运本地不足"] + g["海运本地不足"]), "_n"),
                     "冗余_FBA件数": float(g["FBA冗余件数"].sum()), "冗余_FBA明细": detail(g, "FBA冗余件数"),
+                    "冗余_在途将增加件数": float(g["在途将增加冗余件数"].sum()),
                     "冗余_总件数": float(g["总冗余件数"].sum()), "冗余_总明细": detail(g, "总冗余件数"),
                     "冗余_可削减PO件数": float(g["可削减PO件数"].sum()), "冗余_可削减PO明细": detail(g, "可削减PO件数"),
                     "新SKU观察数": int(g["新SKU观察"].sum()),
@@ -2149,7 +2167,7 @@ def sku_supply(P, replen, ship, po, snap, cfg, q):
                                               if str(a_) in ("Create sale", "Lower price", "Create Outlet deal") and pd.notna(p_))[:300],
                     "促销价明细": "、".join(f"{short(m_)} {v_:.2f}" for m_, v_ in sorted(
                         [(m_, float(v_)) for m_, v_ in zip(g["MSKU"], pd.to_numeric(g["促销价"], errors="coerce")) if pd.notna(v_)], key=lambda t_: t_[1])),
-                    "冗余_预估月仓储费": float(pd.to_numeric(g.loc[g["FBA冗余件数"] > 0, "预估月仓储费"], errors="coerce").fillna(0).sum())})
+                    "冗余_预估月仓储费": float(pd.to_numeric(g["冗余仓储费"], errors="coerce").fillna(0).sum())})
     P = P.merge(pd.DataFrame(agg), on=["店铺", "父ASIN"], how="left")
     bad = P[P["尺码_缺货件数_含待交付"].fillna(0) >= 1].sort_values("尺码_缺货件数_含待交付", ascending=False)
     if len(bad):
@@ -2775,7 +2793,7 @@ PROMPT = """# 角色与任务
 14. 口径一致(常见错误)：
    - "单件毛利"是数据包字段(未扣广告)；用 估算利润÷销量 算出的叫"单件净利(含广告)"，不得混称。
    - 库存状态按字段原值引用(紧张/正常/偏多/新品样本不足/无销量/未在售)，不得把"紧张"的父体归入"偏多"；同一父体可以既有尺码缺货又有冗余尺码，要分开写。
-   - 仓储费：冗余相关用 冗余_预估月仓储费(只算冗余尺码)，全父体用 SP_预估仓储费，同一段里不得混用。
+   - 仓储费只针对FBA在库：冗余相关用 冗余_预估月仓储费(冗余件数分摊的部分)，全父体用 SP_预估仓储费，同一段里不得混用；本地仓、在途不产生亚马逊仓储费。
    - 断货天数/缺货件数越小越好，验证指标写"降到X"，不得写"回升"。
    - 父体转化率低于店内中位，不影响对 ACoS 远低于盈亏线、转化好的单个关键词加价；正文如写"不应加投"，只指父体整体加预算。
    - 引用"合计/共N件"时必须是数据包里的字段或能写出算式的加总；写不出算式就不要写合计。
@@ -2859,7 +2877,8 @@ def store_summary(W):
         r["库存天数(FBA可售÷日均_预测)"] = div(r["FBA可售"], s_("日均_预测")) if "日均_预测" in d.columns else div(r["FBA可售"], (r["销量(件)"] or np.nan) / 7)
         if "尺码_缺货件数_含待交付" in d.columns:
             r["尺码缺货件数(60天,含待交付)"] = s_("尺码_缺货件数_含待交付"); r["尺码本地仓不足件数"] = s_("尺码_本地仓不足件数")
-            r["FBA冗余件数(超90天销量)"] = s_("冗余_FBA件数"); r["冗余尺码月仓储费"] = s_("冗余_预估月仓储费")
+            r["FBA冗余件数(在库超90天销量)"] = s_("冗余_FBA件数"); r["在途到货后再增加冗余"] = s_("冗余_在途将增加件数")
+            r["冗余部分月仓储费(按件分摊)"] = s_("冗余_预估月仓储费")
             r["滞销件数(FBA/本地)"] = f"{s_('滞销_FBA件数') or 0:.0f}/{s_('滞销_本地件数') or 0:.0f}"
         r["库龄90天以上件数"] = s_("SP_库龄90天以上件数"); r["库龄181天以上件数"] = s_("SP_库龄181天以上件数")
         r["下月预估仓储费(全部库存)"] = s_("SP_预估仓储费")
@@ -3207,7 +3226,7 @@ def cmd_pack(a, cfg):
                            "首次断货_全供给_海运_天后", "本地仓最少空运件数_避免断货", "本地仓最少海运件数_避免断货", "空运可售前无法避免断货天数", "建议空运件数", "建议空运件数_按近7天日均", "空运发货_本地仓不足件数",
                            "尺码_当前断码数", "尺码_当前断码_主力数", "尺码_当前断码", "尺码_缺货件数_含待交付", "尺码_缺货占需求比例", "尺码_空运前无法避免缺货件数",
                            "建议空运件数_尺码合计", "空运_本地可发件数", "建议海运发货件数_尺码合计", "海运_本地可发件数", "尺码_本地仓不足件数",
-                           "冗余_FBA件数", "冗余_总件数", "冗余_可削减PO件数", "滞销_SKU数", "滞销_FBA件数", "滞销_本地件数", "新SKU观察数", "亚马逊冗余件数", "冗余_预估月仓储费", "保本价",
+                           "冗余_FBA件数", "冗余_在途将增加件数", "冗余_总件数", "冗余_可削减PO件数", "滞销_SKU数", "滞销_FBA件数", "滞销_本地件数", "新SKU观察数", "亚马逊冗余件数", "冗余_预估月仓储费", "保本价",
                            "建议海运发货件数", "海运发货_本地仓不足件数", "空运可售_天后", "海运可售_天后", "海运发货_覆盖至第N天",
                            "新采购最晚下单_海运_天后", "新采购最晚下单_空运_天后",
                            "未来60日缺口件数_含全部供给", "在途_发往非在售子体件数"] if c in P.columns]
@@ -3249,15 +3268,16 @@ def cmd_pack(a, cfg):
             if "FBA冗余件数" in SK0_.columns:
                 ex_ = SK0_[(SK0_["FBA冗余件数"] >= 5) | (SK0_["滞销"].astype(bool)) | (pd.to_numeric(SK0_["亚马逊冗余件数"], errors="coerce").fillna(0) > 0) | (SK0_["可削减PO件数"] >= 1)].copy()
                 ex_ = ex_.sort_values(["FBA冗余件数", "总冗余件数"], ascending=False).head(int(cfg.get("top_n", {}).get("sku_rows", 60)))
-                for c_ in ("FBA冗余件数", "总冗余件数", "可削减PO件数", "FBA库存天数", "总库存天数"):
+                for c_ in ("FBA冗余件数", "在途将增加冗余件数", "总冗余件数", "可削减PO件数", "FBA库存天数", "总库存天数"):
                     ex_[c_] = pd.to_numeric(ex_[c_], errors="coerce").round(0)
                 ex_["滞销"] = ex_["滞销"].map(lambda v_: "是" if bool(v_) else "")
                 md.append(f"## 3e4. 冗余与滞销(尺码级，最新一周；按FBA冗余降序)\n"
-                          f"说明：FBA冗余=FBA可售+在途−日均_预测×{int(cfg.get('excess_fba_days', 90))}天；总冗余=再加待交付+本地仓−日均_预测×{int(cfg.get('excess_total_days', 180))}天；"
+                          f"说明：FBA冗余=FBA在库可售−日均_预测×{int(cfg.get('excess_fba_days', 90))}天(不含在途；在途到货后再增加的见 在途将增加冗余件数)；"
+                          "冗余仓储费=该SKU亚马逊下月预估仓储费按 冗余件数÷FBA在库件数 分摊(只含FBA，本地仓不收亚马逊仓储费)；总冗余=再加待交付+本地仓−日均_预测×{int(cfg.get('excess_total_days', 180))}天；"
                           "可削减PO=待交付中超出总冗余线的件数；滞销=开售且首次到FBA都满45天、近30天零销量；开售或到FBA不足45天的新SKU不在此表(见 新SKU观察数)。"
                           "亚马逊冗余件数/建议/建议价来自库存计划报告，建议价常低于保本价(见3e 保本价)，只作参考；预估月仓储费=下月亚马逊预估。\n"
                           + md_table(ex_, ["店铺", "款", "MSKU", "日均_预测", "开售天数", "FBA可售", "在途与待上架", "待交付", "本地可用_池", "FBA库存天数", "总库存天数",
-                                           "FBA冗余件数", "总冗余件数", "可削减PO件数", "滞销", "库龄91天以上", "库龄181天以上", "亚马逊冗余件数", "亚马逊建议", "亚马逊建议价", "预估月仓储费"]))
+                                           "FBA冗余件数", "在途将增加冗余件数", "冗余仓储费", "总冗余件数", "可削减PO件数", "滞销", "库龄91天以上", "库龄181天以上", "亚马逊冗余件数", "亚马逊建议", "亚马逊建议价", "预估月仓储费"]))
         md.append("## 3e2. 领星补货建议对照(领星按其自己的参数和日均口径算的；仅对照，冲突时以 3e 为准并说明差异)\n" + md_table(sl2, ["店铺", "款"] + oc2))
     if "断货天数_保守" in sc_:
         sl = P[P["周结束"] == latest].copy()
