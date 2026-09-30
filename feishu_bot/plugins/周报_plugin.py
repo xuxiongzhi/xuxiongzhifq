@@ -360,45 +360,66 @@ def _build(ws: dict, week_end: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _section(md: str, letter: str, next_letter: str) -> str:
-    m = re.search(rf"(?ms)^\s*(?:#+\s*)?\**{letter}[.．、]\s*.*?(?=^\s*(?:#+\s*)?\**{next_letter}[.．、]|\Z)", md)
+def _sec(md: str, start: str, end: str) -> str:
+    """取 Markdown 中从标题 start(正则) 到标题 end(正则) 之间的内容"""
+    m = re.search(rf"(?ms)^\s*#*\s*\**(?:{start}).*?(?=^\s*#*\s*\**(?:{end})|\Z)", md)
     return m.group(0).strip() if m else ""
 
 
+def _prev_actions(ws: dict, week_end: str) -> tuple[str, str]:
+    """上周AI周报的执行建议清单(新格式 八、；兼容旧格式 A.)"""
+    prev_we = (datetime.strptime(week_end, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+    p = _report_path(ws, prev_we)
+    if not os.path.exists(p):
+        return prev_we, ""
+    with open(p, "r", encoding="utf-8") as f:
+        md = f.read()
+    return prev_we, _sec(md, "八、", "九、") or _sec(md, "A[.．、]", "B[.．、]")
+
+
+def _call_ai(prompt: str) -> tuple[str | None, str]:
+    try:
+        text = (ai_runner.run_ai(prompt, timeout=AI_TIMEOUT) or "").strip()
+    except Exception as e:
+        return None, f"AI 调用失败：{e}"
+    if not text or text.startswith("❌"):
+        return None, f"AI 调用失败：{text[:300] or '空回复'}"
+    return text, ""
+
+
 def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
-    """数据包 → ai_runner → 周报_<周>.md。返回 (文件路径, 提示/错误)"""
+    """数据包 → 两次 ai_runner 调用(①数据报告 一~七 ②执行建议 八~十二) → 周报_<周>.md。
+    分两次是因为 ai_runner 单次输出上限(anthropic 通道 4096 tokens)，一次写不下完整周报。返回 (文件路径, 提示/错误)"""
     if not _HAS_AI:
         return None, "未找到 ai_runner 模块，无法生成AI周报"
     pack = _pack_path(ws, week_end)
     if not pack:
         return None, "没有找到该周的AI数据包，请先生成数据"
     with open(pack, "r", encoding="utf-8") as f:
-        prompt = f.read()
-    prev_we = (datetime.strptime(week_end, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
-    prev = _report_path(ws, prev_we)
-    if os.path.exists(prev):                      # 上周AI周报的执行清单，供 E 节评估执行效果
-        with open(prev, "r", encoding="utf-8") as f:
-            a_sec = _section(f.read(), "A", "B")
-        if a_sec:
-            prompt += f"\n\n---\n# 上周({prev_we})AI周报的执行清单(供 E 节评估；如无法确认是否执行，写'未知')\n{a_sec}\n"
-    prompt += ("\n\n---\n# 输出要求\n用 Markdown 输出，按 A~E 五节，每节用二级标题(## A. …)；A 节表格最多10行；"
-               "全文控制在约4000字以内，不要复述数据包原文。第一行写标题：# 亚马逊周报 " + week_end)
-    try:
-        text = ai_runner.run_ai(prompt, timeout=AI_TIMEOUT)
-    except Exception as e:
-        return None, f"AI 调用失败：{e}"
-    text = (text or "").strip()
-    if not text or text.startswith("❌"):
-        return None, f"AI 调用失败：{text[:300] or '空回复'}"
-    note = ""
-    if not re.search(r"(?m)^\s*(?:#+\s*)?\**E[.．、]", text):
-        note = "⚠️ 周报没有 E 节，可能被输出长度截断"
+        data = f.read()
+    part1, err = _call_ai(data + "\n\n---\n# 本次任务\n只输出**第一部分 数据报告**：第一行 `# 亚马逊周报 " + week_end
+                          + "`，然后按 一~七 写；不要输出第二部分。严格遵守第一原则(没有的数据写'无数据')。全文约4500字以内，表格优先，不复述数据包原文。")
+    if not part1:
+        return None, err
+    prev_we, prev = _prev_actions(ws, week_end)
+    prev_block = (f"\n\n---\n# 上周({prev_we})AI周报的执行建议清单(供 十二 节逐条评估；无法确认是否执行的写'未知')\n{prev}\n"
+                  if prev else "\n\n(没有上周的AI周报，十二 节写'无')\n")
+    part2, err = _call_ai(data + "\n\n---\n# 已写好的第一部分(数据报告)\n" + part1 + prev_block
+                          + "\n---\n# 本次任务\n只输出**第二部分 执行建议**：以 `## 第二部分 执行建议` 开头，按 八~十二 写。"
+                          "每条建议的数字必须与数据包和第一部分一致；不要重复第一部分的内容。约3500字以内。")
+    if not part2:
+        return None, "第一部分已生成，但" + err
+    notes = []
+    if not re.search(r"七、", part1):
+        notes.append("第一部分没有写到 七、，可能被输出长度截断")
+    if not re.search(r"十一、", part2):
+        notes.append("第二部分没有写到 十一、，可能被输出长度截断")
     path = _report_path(ws, week_end)
     head = (f"<!-- 生成：{datetime.now():%Y-%m-%d %H:%M}；数据包：{os.path.basename(pack)}；"
             f"工作区：{'测试' if ws is WS['测试'] else '正式'} -->\n")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(head + text + "\n")
-    return path, note
+        f.write(head + part1 + "\n\n" + part2 + "\n")
+    return path, ("⚠️ " + "；".join(notes)) if notes else ""
 
 
 def _overview(ws: dict, week_end: str, report: str, note: str, secs: int) -> str:
@@ -426,18 +447,18 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int) -> str
         n_e, n_w = int((Q["级别"] == "ERROR").sum()), int((Q["级别"] == "WARN").sum())
         sp_bad = Q[Q["级别"].isin(["ERROR", "WARN"]) & Q["检查项"].astype(str).str.startswith("SP-API")]["检查项"].tolist()
         if n_e or n_w:
-            lines.append(f"· 数据质量：{n_e} 个错误、{n_w} 个警告(详见周报 C 节)" + (f"；SP-API 未取全：{'、'.join(sp_bad[:4])}" if sp_bad else ""))
+            lines.append(f"· 数据质量：{n_e} 个错误、{n_w} 个警告(详见周报 十一 节)" + (f"；SP-API 未取全：{'、'.join(sp_bad[:4])}" if sp_bad else ""))
     except Exception:
         pass
     try:
         with open(report, "r", encoding="utf-8") as f:
-            a_sec = _section(f.read(), "A", "B")
-        rows = [l for l in a_sec.splitlines() if l.strip().startswith("|") and not re.match(r"^\s*\|[\s:|-]+\|\s*$", l)][1:]
+            act = _sec(f.read(), "八、", "九、")
+        rows = [l for l in act.splitlines() if l.strip().startswith("|") and not re.match(r"^\s*\|[\s:|-]+\|\s*$", l)][1:]
         if rows:
-            lines.append("· 本周执行清单(前3条)：")
+            lines.append(f"· 执行建议 {len(rows)} 条，前3条：")
             for l in rows[:3]:
                 cells = [c.strip() for c in l.strip().strip("|").split("|")]
-                lines.append("  " + " | ".join(c for c in cells[1:3] if c)[:120])
+                lines.append("  " + " | ".join(c for c in cells[:3] if c)[:140])
     except Exception:
         pass
     if note:

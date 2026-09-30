@@ -17,15 +17,17 @@ SENT = []
 
 
 def _fake_ai(prompt, timeout=600, model=None):
-    log = os.path.join(PLUGINS, "weekly_report", "logs", "last_ai_prompt.md")
-    with open(log, "w", encoding="utf-8") as f:
+    part = 2 if "只输出**第二部分" in prompt else 1
+    with open(os.path.join(PLUGINS, "weekly_report", "logs", f"last_ai_prompt_{part}.md"), "w", encoding="utf-8") as f:
         f.write(prompt)
-    return ("# 亚马逊周报(模拟AI输出)\n\n## A. 本周执行清单\n| 序号 | 对象 | 动作(含数值) | 依据数据 | 预计影响 | 置信度 | 下周验证指标 |\n|---|---|---|---|---|---|---|\n"
-            "| 1 | tangliuquan-US/ZJCY076 | 空运补货175件、降竞价10% | 第13天断货 | 避免断货 | 中 | 可售天数 |\n"
-            "| 2 | tangliuquan-US/ZJTX073 | 本周海运发59件 | 第39天断货 | 避免断货 | 中 | 发货单 |\n"
-            "| 3 | tangliuquan-US/ZJPL065 | 降价清库龄 | 库存262天 | 降仓储费 | 低 | 库存天数 |\n\n"
-            f"## B. 暂不动作\n(模拟)\n\n## C. 需要人工核实\n(模拟)\n\n## D. 需要补充的数据\n(模拟)\n\n## E. 相对上周的判断修正\n无\n\n"
-            f"<!-- prompt 长度 {len(prompt)} 字符 -->\n")
+    if part == 1:
+        return ("# 亚马逊周报(模拟AI输出)\n\n## 第一部分 数据报告\n## 一、执行摘要\n(模拟)\n## 二、分析口径\n## 三、核心指标总览\n## 四、本期最异常指标\n"
+                "## 五、板块分析\n## 六、板块交叉对比\n## 七、最该关注的3个问题与3个机会\n(模拟)")
+    return ("## 第二部分 执行建议\n## 八、执行建议清单\n| 优先级 | 对象 | 动作 | 依据数据 | 预期影响 | 时限 | 验证指标 | 置信度 |\n|---|---|---|---|---|---|---|---|\n"
+            "| P0 | tangliuquan-US/ZJCY076 | 本地仓空运175件 | 第13天断货 | 避免断货 | 今日 | 可售天数 | 中 |\n"
+            "| P0 | tangliuquan-US/ZJTX073 | 本周海运发59件 | 第39天断货 | 避免断货 | 本周 | 发货单 | 中 |\n"
+            "| P1 | tangliuquan-US/ZJPL065 | 降价清库龄 | 库存262天 | 降仓储费 | 本周 | 库存天数 | 低 |\n"
+            "## 九、暂不动作\n## 十、需要人工确认的操作\n## 十一、数据限制与缺口\n## 十二、相对上周的判断修正\n无\n")
 
 
 def main(cmds):
