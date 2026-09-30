@@ -34,7 +34,7 @@ DEFAULT_RULES = {
     "air_min_units": 10,             # 建议空运件数少于这个数不单独空运(并入海运)；>=3倍时规则优先级P0，否则P1
     "sea_min_units": 5,              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
     "excess_min_units": 20,          # 冗余/库龄风险/亚马逊冗余>=此件数才列清货候选；本地滞销>=此件数才列停采/清仓
-    "aged_fee_p1_units": 20,         # 卖出前会过收费线(服装271天)的件数>=此值，且 aged_fee_urgent_days 天内就开始过线 → 清货P1(紧急)；否则P2(预警)
+    "aged_fee_urgent_units": 5,      # aged_fee_urgent_days(默认90天)内就会过收费线(服装271天)的件数>=此值 → 清货P1(紧急)；否则P2(预警)
     "po_reduce_min_units": 10,
     "price_gap_check": 0.05,         # 实际售价(促销价优先)比竞品最低价高>=5% 才列核价候选
     "price_floor_tol": 0.02,         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)
@@ -112,7 +112,12 @@ def parent_flags(r, R):
         block.append(f"订单促销占比={pr:.0%}>{R['block_promo_share']:.0%}")
     s30, sgap = _f(r.get("尺码_30天缺货占比")), _f(r.get("尺码_本地仓不足占比"))
     rec = _f(r.get("主力尺码恢复有货_天后"))
-    when = f"主力尺码预计第{rec:.0f}天补齐后再评估" if rec else "主力尺码靠现有在途/待交付60天内补不齐，需先发货或采购"
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        rdate = (_dt.strptime(str(r.get("模拟起算日"))[:10], "%Y-%m-%d") + _td(days=rec)).strftime("%m-%d") if rec else ""
+    except (ValueError, TypeError):
+        rdate = ""
+    when = (f"主力尺码预计第{rec:.0f}天({rdate})补齐后再评估" if rdate else f"主力尺码预计第{rec:.0f}天补齐后再评估") if rec else "主力尺码靠现有在途/待交付60天内补不齐，需先发货或采购"
     if s30 is not None and s30 >= R["size_block_30d"]:
         block.append(f"未来30天尺码缺货占需求{s30:.0%}({when})")
     if sgap is not None and sgap >= R["size_block_localgap"]:
@@ -230,10 +235,12 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
         fee_d = int((cfg or {}).get("aged_fee_days", 271))
         urg_d = int((cfg or {}).get("aged_fee_urgent_days", 90))
         first_fee = _f(r.get("库龄_首批过收费线_天后"))
-        urgent = cross_fee >= R["aged_fee_p1_units"] and first_fee is not None and first_fee <= urg_d
+        soon = _f(r.get("库龄_近期过收费线件数")) or 0             # urg_d 天内就会过收费线的件数
+        urgent = soon >= R["aged_fee_urgent_units"] and first_fee is not None and first_fee <= urg_d
         if max(exf, amz, cross + aged) >= R["excess_min_units"]:
             base_q = max(exf, cross + aged)            # 已满181天的也要清
             q = round(base_q if base_q >= R["excess_min_units"] else amz)   # 清货量取 冗余 与 卖出前会过库龄线 的较大者
+            q = min(q, round(_f(r.get("FBA可售")) or q))                  # 不能超过FBA在库可售
             amz_txt = r.get("亚马逊建议促销明细") or ""
             low = ""
             if amz_txt and be_p:
@@ -242,7 +249,7 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
                     low = f"；亚马逊建议价最低{min(ps):.2f}低于保本价{be_p:.2f}，不宜照做"
             add("INV_CLEAR", key, 对象="冗余尺码", 单位="件", 当前值=0, 建议值=q, 允许范围=[math.ceil(q * 0.5), math.ceil(q * 1.2)],
                 规则优先级="P1" if (urgent or sto >= 50) else "P2", _rank=5e3 + q + (1e4 if urgent else 0), 父体概况=ctx,
-                依据=((f"【紧急】{first_fee:.0f}天内就有货过{fee_d}天收费线(服装库龄附加费)，卖出前会过线{cross_fee:.0f}件；" if first_fee else f"【紧急】已有货过{fee_d}天收费线，卖出前会过线{cross_fee:.0f}件；") if urgent
+                依据=((f"【紧急】约{first_fee:.0f}天后(库龄按分桶中点估算)有{soon:.0f}件过{fee_d}天收费线(服装库龄附加费)，要在这之前清掉；卖出前累计会过线{cross_fee:.0f}件(其余更晚才过线)；" if first_fee else f"【紧急】已有{soon:.0f}件过{fee_d}天收费线；卖出前累计会过线{cross_fee:.0f}件；") if urgent
                       else (f"【仓储费高】冗余部分月仓储费约${sto:.0f}≥$50；" if sto >= 50 else "")
                       + (f"【预警】约第{first_fee:.0f}天才开始过{fee_d}天收费线(卖出前会过线{cross_fee:.0f}件)，先停补货、小幅促销；" if cross_fee > 0 and first_fee else "【预警】"))
                      + f"卖出前会满181天(预警线，留约90天清货)的有{cross:.0f}件：{(r.get('库龄风险明细') or '-')[:140]}"
@@ -578,7 +585,22 @@ def validate(sel, cands, cfg=None):
             blocked.append({**x, "状态": "拦截", "原因": f"超过每周最多{R['max_selected']}条"})
         keep = keep[: R["max_selected"]]
     manual = [m for m in manual if isinstance(m, dict)]
-    return {"passed": keep, "blocked": blocked, "manual": manual}
+    # 人工事项不得绕过规则：被阻止加投的父体，人工事项里写加价/加预算/收割/新建手动词 → 拦截
+    stopped = {}
+    for c in cands:
+        if c["类型"] in UP_TYPES and not c["可选"] and c["阻止原因"].startswith("父体有断货"):
+            stopped.setdefault(c["款"], c["阻止原因"])
+    up_words = re.compile(r"加价|提价|提高竞价|加预算|提高预算|上调预算|收割|新建.{0,6}(手动|精准)|加投|扩量|加大广告")
+    keep_m = []
+    for m in manual:
+        txt = f"{m.get('对象', '')} {m.get('动作', '')}"
+        hit = [k for k in stopped if k in txt]
+        if hit and up_words.search(str(m.get("动作", ""))):
+            blocked.append({"id": "人工事项", "对象": m.get("对象", ""), "理由": m.get("理由", ""), "状态": "拦截",
+                            "原因": f"{hit[0]} 被规则阻止加投({stopped[hit[0]][:60]}…)，人工事项不能绕过"})
+        else:
+            keep_m.append(m)
+    return {"passed": keep, "blocked": blocked, "manual": keep_m}
 
 
 def _action_txt(x):
@@ -675,6 +697,20 @@ def lint_report(text, P):
                 bad = [k for k in tight if k in c or re.search(rf"/{k[-3:]}(?!\d)", c)]
                 if bad:
                     issues.append(f"「{c.strip()[:80]}」把库存状态=紧张的 {'、'.join(bad)} 和'偏多'写在一起")
+    # 2b) "断码"只能指当前可售为0的尺码
+    if "尺码_当前断码" in P.columns:
+        cur = {str(k): str(v) for k, v in zip(P["款"], P["尺码_当前断码"].fillna(""))}
+        for c in clauses:
+            if "断码" not in c:
+                continue
+            for k, v in cur.items():
+                if k not in c:
+                    continue
+                seg = c[c.index(k):c.index(k) + 60]
+                sizes = set(re.findall(r"(?<![A-Za-z0-9])([A-Z]{2}-\d?X{0,3}[SML])(?![A-Za-z0-9])", seg))
+                wrong = [z for z in sizes if z not in v]
+                if wrong:
+                    issues.append(f"「{c.strip()[:80]}」把 {k} 的 {'、'.join(sorted(wrong))} 写成断码，但现在有货(当前断码只有：{v or '无'})")
     # 3) 方向写反
     for c in clauses:
         if re.search(r"(断货天数|缺货件数|缺口)[^，,]{0,12}(回升|升至|提高到)", c):
