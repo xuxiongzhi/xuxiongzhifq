@@ -102,3 +102,6 @@ dist
 
 # TernJS port file
 .tern-port
+
+# 插件打包下载文件(由 git archive 生成)
+/经营周报插件.zip
