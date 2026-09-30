@@ -99,7 +99,7 @@ def parent_flags(r, R):
     d_cons = _f(r.get("断货天数_保守"))
     if d_cons and d_cons > 0:
         block.append(f"断货天数_保守={d_cons:.0f}(首次断货第{_f(r.get('首次断货_天后')) or 0:.0f}天)")
-    dd = _f(r.get("含在途天数_7"))
+    dd = _f(r.get("含在途天数_预测")) if r.get("含在途天数_预测") is not None else _f(r.get("含在途天数_7"))
     if dd is not None and dd < R["block_stock_days"]:
         block.append(f"含在途天数_7={dd:.0f}<{R['block_stock_days']}")
     if str(r.get("库存状态") or "") == "紧张":
@@ -314,8 +314,10 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
                 hi = min(bid * (1 + R["bid_up_max_step"]), be_cpc) if be_cpc else bid * (1 + R["bid_up_max_step"])
                 lo = bid * 1.05
                 if hi >= lo:
+                    rel = _f(r.get("转化率相对店内中位"))
                     add("AD_BID_UP", key, **base, 建议值=_r2(min(bid * (1 + R["bid_up_step"]), hi)), 允许范围=[_r2(lo), _r2(hi)],
-                        规则优先级="P2", _rank=sales, 依据=ev + (f"；盈亏平衡CPC={be_cpc:.2f}" if be_cpc else ""))
+                        规则优先级="P2", _rank=sales, 依据=ev + f"；该词CVR {od / clk:.1%}" + (f"(父体全站转化率为店内中位{rel:.2f}倍，加价只针对这个转化好的词)" if rel is not None and rel < 0.8 else "")
+                        + (f"；盈亏平衡CPC={be_cpc:.2f}" if be_cpc else ""))
             elif judged and od > 0 and be and acos is not None and acos > be:
                 tgt = bid * max(R["bid_down_min_ratio"], be / acos)
                 add("AD_BID_DOWN", key, **base, 建议值=_r2(tgt), 允许范围=[_r2(bid * R["bid_down_min_ratio"]), _r2(bid * 0.95)],
@@ -598,3 +600,85 @@ def to_jsonable(o):
     if isinstance(o, np.bool_):
         return bool(o)
     return o
+
+
+# --------------------------------------------------------------------------- AI 正文一致性检查
+LINT_METRICS = {   # 关键词 -> 父体表里可作为出处的字段(单父体值、全部合计、任意两父体之和都算有出处)
+    "待上架": ["货件_已签收待上架件数", "货件_入库中待收件数"],
+    "缺": ["尺码_缺货件数_含待交付", "尺码_缺货件数_保守", "尺码_本地仓不足件数", "尺码_空运本地不足件数", "尺码_空运前无法避免缺货件数"],
+    "冗余": ["冗余_FBA件数", "冗余_总件数", "亚马逊冗余件数"],
+    "不足": ["尺码_本地仓不足件数", "尺码_空运本地不足件数"],
+    "滞销": ["滞销_FBA件数", "滞销_本地件数"],
+}
+_LOCAL_OK = re.compile(r"本地仓[^。；\n]{0,12}(充足|足够|够用)|无需(新增)?(新)?采购|不需要新增采购|暂不需要新增采购|直接(空运|海运)?调拨[^。；\n]{0,8}避免断货")
+
+
+def lint_report(text, P):
+    """检查 AI 写的正文(不含程序生成的 八 节)里常见的自相矛盾与无出处数字。返回问题列表(字符串)"""
+    issues = []
+    body = re.sub(r"(?ms)^\s*#{1,3}\s*\**八、.*?(?=^\s*#{1,3}\s*\**九、|\Z)", "", text)
+    clauses = [c for c in re.split(r"[。；\n]", body) if c.strip()]
+    P = P.copy()
+    num = lambda c: pd.to_numeric(P[c], errors="coerce") if c in P.columns else pd.Series(dtype=float)
+    # 1) 本地仓"充足/无需采购" vs 尺码级本地仓不足
+    if "尺码_本地仓不足件数" in P.columns:
+        gap = P[num("尺码_本地仓不足件数") >= 5]
+        if len(gap):
+            for c in clauses:
+                if _LOCAL_OK.search(c):
+                    hit = [k for k in gap["款"].astype(str) if k in c or k[-3:] in c]
+                    if hit or not re.search(r"ZJ|SZ|HX", c):
+                        issues.append(f"写了本地仓够用/无需采购：「{c.strip()[:80]}」，但尺码级本地仓不足：" +
+                                      "、".join(f"{a_} {b_:.0f}件" for a_, b_ in zip(gap["款"], num("尺码_本地仓不足件数")[gap.index]) if not hit or a_ in hit))
+    # 2) 库存状态混称：同一句里写"偏多"，却点名了 库存状态=紧张 的父体
+    if "库存状态" in P.columns:
+        tight = set(P.loc[P["库存状态"] == "紧张", "款"].astype(str))
+        for c in clauses:
+            if "偏多" in c:
+                bad = [k for k in tight if k in c or re.search(rf"/{k[-3:]}(?!\d)", c)]
+                if bad:
+                    issues.append(f"「{c.strip()[:80]}」把库存状态=紧张的 {'、'.join(bad)} 和'偏多'写在一起")
+    # 3) 方向写反
+    for c in clauses:
+        if re.search(r"(断货天数|缺货件数|缺口)[^，,]{0,12}(回升|升至|提高到)", c):
+            issues.append(f"「{c.strip()[:80]}」：断货天数/缺货件数应该下降，写成了回升")
+    # 4) 关键词旁的件数必须有出处：数字归到它前面最近的关键词，只认单父体值或合计(合计允许±5%：可能只加了部分父体)
+    singles, totals = {}, {}
+    for kw, cols in LINT_METRICS.items():
+        sv, tv = set(), []
+        for col in cols:
+            v = num(col).dropna()
+            v = v[v > 0]
+            sv |= set(v.round(0).astype(int))
+            tv += [float(v.sum()), float(v[v >= 20].sum())]
+        if kw == "待上架" and "尺码_当前断码" in P.columns:      # 主力断码里的'已到仓N件待上架'
+            for t_ in P["尺码_当前断码"].dropna().astype(str):
+                sv |= {int(x) for x in re.findall(r"已到仓(\d+)件", t_)}
+        singles[kw], totals[kw] = sv, [t for t in tv if t > 0]
+    kws = "|".join(LINT_METRICS)
+    for c in clauses:
+        for m in re.finditer(r"(\d{2,5})\s*件", c):
+            pre = c[max(0, m.start() - 16):m.start()]
+            ks = [(pre.rfind(k), k) for k in LINT_METRICS if k in pre]
+            if not ks or re.search(r"[/、()（）]", pre[max(k for k, _ in ks):]):
+                continue                                   # 前面没有关键词，或关键词和数字之间隔着别的对象
+            kw = max(ks)[1]
+            n_ = int(m.group(1))
+            if not singles[kw]:
+                continue
+            if any(abs(n_ - v) <= 1 for v in singles[kw]) or any(abs(n_ - t) <= max(2, 0.05 * t) for t in totals[kw]):
+                continue
+            snip = c[max(0, m.start() - 30):m.end() + 10].strip()
+            issues.append(f"「…{snip}…」里的 {n_} 件在数据包的'{kw}'相关字段里找不到出处")
+    out, seen = [], set()
+    for x in issues:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+
+def lint_md(issues):
+    if not issues:
+        return ""
+    return ("\n## 附：程序一致性检查(自动)\n以下是程序在 AI 正文里发现的疑似矛盾或无出处数字，引用前请人工核对：\n" +
+            "\n".join(f"- {x}" for x in issues) + "\n")

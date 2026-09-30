@@ -549,6 +549,19 @@ def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
     except Exception as e:
         _log(f"[校验] 失败：{e}", "error")
         notes.append(f"执行清单校验出错：{e}")
+    try:                                          # 正文一致性检查(本地仓够用/状态混称/方向写反/无出处数字)，结果附在周报末尾
+        import pandas as pd
+        ACT = _engine_mod("actions")
+        Pw = pd.read_csv(os.path.join(ws["out"], f"weekly_parent_{week_end}.csv"), encoding="utf-8-sig")
+        lint = ACT.lint_report(part1 + "\n" + part2, Pw)
+        if lint:
+            part2 = part2.rstrip() + "\n" + ACT.lint_md(lint)
+            _log(f"[校验] 正文一致性检查：发现 {len(lint)} 处疑似问题(已附在周报末尾)")
+            for x in lint:
+                _log(f"[校验]   {x[:160]}")
+        _write_state({f"lint_{'test' if ws is WS['测试'] else 'formal'}_{week_end}": len(lint)})
+    except Exception as e:
+        _log(f"[校验] 正文一致性检查失败：{e}", "warning")
     if not re.search(r"七、", part1):
         notes.append("第一部分没有写到 七、，可能被输出长度截断")
     if not re.search(r"十一、", part2):
@@ -639,6 +652,9 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
                 lines.append("  " + " | ".join(c for c in cells[:3] if c)[:140])
     except Exception:
         pass
+    n_lint = _read_state().get(f"lint_{'test' if ws is WS['测试'] else 'formal'}_{week_end}")
+    if n_lint:
+        lines.append(f"· ⚠️ 正文一致性检查：发现 {n_lint} 处疑似矛盾/无出处数字，已列在周报末尾“附：程序一致性检查”，引用前请核对")
     if note:
         lines.append(note)
     lines.append(f"完整周报见附件 {os.path.basename(sent or _report_path(ws, week_end))}；用时 {secs // 60} 分 {secs % 60} 秒")
