@@ -589,6 +589,12 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
                     lines.append("· 尺码缺货(60天内，含待交付仍缺)：" + "、".join(
                         f"{r['款']} 缺{r['尺码_缺货件数_含待交付']:.0f}件" + (f"(本地仓对应尺码不足{r['尺码_本地仓不足件数']:.0f})" if r.get("尺码_本地仓不足件数", 0) >= 5 else "")
                         for _, r in sz.head(5).iterrows()))
+            if "冗余_FBA件数" in P.columns:              # 冗余/滞销：清货与停采
+                ex = P[P["冗余_FBA件数"].fillna(0) >= 20].sort_values("冗余_FBA件数", ascending=False)
+                if len(ex):
+                    lines.append(f"· 冗余(FBA超90天销量)共 {ex['冗余_FBA件数'].sum():.0f} 件：" + "、".join(
+                        f"{r['款']} {r['冗余_FBA件数']:.0f}" for _, r in ex.head(5).iterrows())
+                        + (f"；滞销尺码(满45天、近30天零销量) FBA {P['滞销_FBA件数'].sum():.0f} 件、本地仓 {P['滞销_本地件数'].sum():.0f} 件" if "滞销_FBA件数" in P.columns else ""))
             only = P[(P["断货天数_保守"].fillna(0) > 0) & (P["断货天数_含待交付"].fillna(0) == 0)]
             if len(only):
                 lines.append("· 待交付按时到才不断货：" + "、".join(only["款"].astype(str).head(5)) + "(要盯PO交期)")

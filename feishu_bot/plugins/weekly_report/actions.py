@@ -32,7 +32,9 @@ DEFAULT_RULES = {
     "harvest_min_orders": 2,
     "harvest_min_clicks": 5,         # 只有1~2次点击的"出单词"多是7天归因带来的，不收割
     "air_min_units": 10,             # 建议空运件数少于这个数不单独空运(并入海运)；>=3倍时规则优先级P0，否则P1
-    "sea_min_units": 5,              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
+    "sea_min_units": 5,
+    "excess_min_units": 20,          # FBA冗余(或亚马逊冗余)>=此件数才列清货候选；本地滞销>=此件数才列停采/清仓
+    "po_reduce_min_units": 10,              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
     "block_stock_days": 21,          # 含在途天数<21 不加投(提示词硬性规则3)
     "block_promo_share": 0.3,        # 订单促销占比>30% 不加投(提示词硬性规则10)
     "size_block_share": 0.2,         # 尺码级缺货件数占60天需求>=20% 不加投(主力尺码断货，加投的流量转化不了)
@@ -47,6 +49,9 @@ TYPE_INFO = {   # 类型: (ID前缀, 中文名, 执行方式)
     "PO_FOLLOWUP": ("PF", "催交已逾期采购单", "人工"),
     "PO_NEW": ("PN", "新采购下单", "人工"),
     "PO_SIZE_GAP": ("PG", "尺码缺口：催PO/工厂直发/新采购", "人工"),
+    "INV_CLEAR": ("XC", "冗余清货(优惠券/秒杀/降价，不低于保本价)", "人工(需确认)"),
+    "PO_REDUCE": ("XP", "削减/延后待交付PO", "人工"),
+    "LOCAL_SLOW": ("XL", "本地仓滞销尺码：停止采购/清仓", "人工"),
     "AD_THROTTLE": ("CT", "控速：下调活动预算", "API(需确认)"),
     "AD_BUDGET_UP": ("BU", "上调活动预算", "API(需确认)"),
     "AD_BID_UP": ("UP", "提高竞价", "API"),
@@ -196,6 +201,39 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
             add("PO_NEW", key, 对象="工厂新采购", 单位="件", 当前值=0, 建议值=gap, 允许范围=[gap, math.ceil(gap * 1.3)],
                 规则优先级="P0" if po_d <= 7 else "P1", _rank=1e4 + gap,
                 依据=f"全供给仍缺{gap:.0f}件(未来60日)；海运最晚下单第{po_d:.0f}天(<0=已来不及)")
+
+    # ---- 冗余/滞销：清货促销、削减PO、本地滞销停采(与缺货并存时只针对冗余的尺码)
+    for key, r in info.items():
+        if (_f(r.get("在售子体数")) or 0) <= 0:
+            continue
+        exf, amz = _f(r.get("冗余_FBA件数")) or 0, _f(r.get("亚马逊冗余件数")) or 0
+        be_p, price = _f(r.get("保本价")), _f(r.get("SP_我方价格")) or _f(r.get("均价"))
+        a181, a91 = _f(r.get("SP_库龄181天以上件数")) or 0, _f(r.get("SP_库龄90天以上件数")) or 0
+        sto = _f(r.get("冗余_预估月仓储费")) or 0
+        ctx = (f"日均_预测={_f(r.get('日均_预测')) or 0:.1f}，FBA可售={_f(r.get('FBA可售')) or 0:.0f}；库龄91天以上{a91:.0f}件、181天以上{a181:.0f}件；"
+               f"当前价{price or 0:.2f}、保本价{be_p or 0:.2f}")
+        if max(exf, amz) >= R["excess_min_units"]:
+            q = round(exf if exf >= R["excess_min_units"] else amz)
+            amz_txt = r.get("亚马逊建议促销明细") or ""
+            low = ""
+            if amz_txt and be_p:
+                ps = [float(x) for x in re.findall(r"建议价([\d.]+)", amz_txt)]
+                if ps and min(ps) < be_p:
+                    low = f"；亚马逊建议价最低{min(ps):.2f}低于保本价{be_p:.2f}，不宜照做"
+            add("INV_CLEAR", key, 对象="冗余尺码", 单位="件", 当前值=0, 建议值=q, 允许范围=[math.ceil(q * 0.5), math.ceil(q * 1.2)],
+                规则优先级="P1" if (a181 > 0 or sto >= 50) else "P2", _rank=5e3 + q, 父体概况=ctx,
+                依据=f"FBA冗余{exf:.0f}件(超{int((cfg or {}).get('excess_fba_days', 90))}天销量)：{(r.get('冗余_FBA明细') or '-')[:160]}；亚马逊估算冗余{amz:.0f}件；"
+                     f"冗余尺码下月预估仓储费${sto:.0f}{low}；促销价不得低于保本价")
+        po_cut = _f(r.get("冗余_可削减PO件数")) or 0
+        if po_cut >= R["po_reduce_min_units"]:
+            add("PO_REDUCE", key, 对象="待交付PO中冗余的尺码", 单位="件", 当前值=_f(r.get("待交付")) or 0, 建议值=round(po_cut),
+                允许范围=[math.ceil(po_cut * 0.5), math.ceil(po_cut)], 规则优先级="P1", _rank=4e3 + po_cut, 父体概况=ctx,
+                依据=f"这些尺码算上待交付后超过180天销量：{r.get('冗余_可削减PO明细') or '-'}；与工厂协商减少或延后，未开工的优先")
+        sl = _f(r.get("滞销_本地件数")) or 0
+        if sl >= R["excess_min_units"]:
+            add("LOCAL_SLOW", key, 对象="本地仓滞销尺码", 单位="件", 当前值=sl, 建议值=None, 规则优先级="P3", _rank=3e3 + sl, 父体概况=ctx,
+                依据=f"开售与到FBA都满45天、近30天零销量的尺码：{r.get('滞销明细') or '-'}(含FBA {(_f(r.get('滞销_FBA件数')) or 0):.0f}件、本地仓{sl:.0f}件)；"
+                     "停止采购这些尺码，本地仓可考虑清仓/捆绑，不要再发FBA")
 
     # ---- 控速(预算)与加预算：活动级，最新一周
     if C is not None and len(C):
@@ -488,7 +526,9 @@ def validate(sel, cands, cfg=None):
 def _action_txt(x):
     t = x["类型"]
     v = x.get("最终值")
-    if t in ("INV_AIR_SHIP", "INV_SEA_SHIP", "PO_NEW", "PO_SIZE_GAP"):
+    if t == "LOCAL_SLOW":
+        return f"{x['类型名']}({x['当前值']:.0f} 件)"
+    if t in ("INV_AIR_SHIP", "INV_SEA_SHIP", "PO_NEW", "PO_SIZE_GAP", "INV_CLEAR", "PO_REDUCE"):
         return f"{x['类型名']} {v:.0f} 件" if v is not None else x["类型名"]
     if t == "PO_FOLLOWUP":
         return f"{x['类型名']}({x['当前值']:.0f} 件已过预计到货日)"
