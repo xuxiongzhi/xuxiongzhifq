@@ -3,10 +3,10 @@
 #   - 伪造 config / feishu_gateway / ai_runner 三个上层模块
 #   - 伪造的 ai_runner 返回一份固定格式的周报(A~E节)，并把收到的 prompt 存到 logs/ 供检查
 #   - 发文件改为打印(不请求飞书)
-# 真实 AI 内容需在机器人里用 /周报 测试 验证。
+# 真实 AI 内容需在机器人里用 /经营周报 测试 验证。
 #
 # 用法：
-#   python tools/local_test.py "/周报 测试" "/周报 发送 2026-09-26" "/周报"
+#   python tools/local_test.py "/经营周报 测试" "/经营周报 发送 2026-09-26" "/经营周报"
 
 import json, os, sys, threading, time, types
 
@@ -38,7 +38,7 @@ def main(cmds):
     sys.modules["ai_runner"] = types.SimpleNamespace(run_ai=_fake_ai)
     sys.path.insert(0, PLUGINS)
     import importlib.util
-    spec = importlib.util.spec_from_file_location("周报_plugin", os.path.join(PLUGINS, "周报_plugin.py"))
+    spec = importlib.util.spec_from_file_location("周报_plugin", os.path.join(PLUGINS, "经营周报_plugin.py"))
     plugin = importlib.util.module_from_spec(spec); spec.loader.exec_module(plugin)
 
     def fake_send_file(path, message_id="", chat_id=""):
@@ -61,4 +61,4 @@ def main(cmds):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:] or ["/周报"])
+    main(sys.argv[1:] or ["/经营周报"])

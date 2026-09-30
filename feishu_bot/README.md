@@ -1,13 +1,13 @@
 # 亚马逊周报 · 飞书插件
 
-店铺 A 后端里的 `/周报` 插件。两个卖家账号(tangliuquan、xupeng)合并出一份汇总周报：
+店铺 A 后端里的 `/经营周报` 插件。两个卖家账号(tangliuquan、xupeng)合并出一份汇总周报：
 领星周数据 + SP-API → 周宽表与 AI 数据包 → `ai_runner`(默认模型)写周报(.md 保存) → 转成 PDF → **群里只发 PDF 周报，最后发一条概述**。
 
 ## 目录
 
 ```
 plugins/
-├─ 周报_plugin.py              # 指令、AI 调用、发文件、定时(放进店铺A的 plugins/)
+├─ 经营周报_plugin.py              # 指令、AI 调用、发文件、定时(放进店铺A的 plugins/)
 └─ weekly_report/               # 数据引擎(整个目录放进店铺A的 plugins/)
    ├─ weekly_pipeline_spapi.py  # ingest(合并) / pack(AI数据包) / window
    ├─ recognize.py              # 按表头识别领星导出、统一改名、检查齐全
@@ -27,24 +27,24 @@ tools/local_test.py             # 本地模拟(伪造 config/feishu_gateway/ai_r
 ## 现阶段：测试
 
 1. 把领星导出和 SP-API 下载的 `.bin` 放进 `plugins/weekly_report/test/inputs/2026-09-26/`。
-2. 群里发 `/周报 测试`(不带日期=测试文件夹里最新的一周)。
+2. 群里发 `/经营周报 测试`(不带日期=测试文件夹里最新的一周)。
 3. 收到：进度提示 → `周报_2026-09-26.pdf` 文件 → 概述(店铺汇总、断货风险、数据质量、执行清单前3条)。
 
 ## 正式上线(领星自动化接入后)
 
-1. 领星导出放 `data/inbox/`(以后由自动下载写入)，`/周报 导入` → `/周报 生成`。
-2. 在目标群发 `/周报 绑定`，再发 `/周报 定时 开启`：每周五 13:00(北京时间)自动跑上一周(周日~周六)，
+1. 领星导出放 `data/inbox/`(以后由自动下载写入)，`/经营周报 导入` → `/经营周报 生成`。
+2. 在目标群发 `/经营周报 绑定`，再发 `/经营周报 定时 开启`：每周五 13:00(北京时间)自动跑上一周(周日~周六)，
    从 inbox 导入 → 拉 SP-API → AI 周报 → 发文件 + 概述；文件不全会在群里提示缺什么。
 3. 凭证：`ziliao/亚马逊sp-api.txt`、`ziliao/亚马逊sp-api-xupeng.txt`。依赖：`pandas openpyxl requests python-amazon-sp-api markdown`；PDF 用本机 Chrome(或 Edge)，找不到时设环境变量 `CHROME_PATH`。转 PDF 失败会改发 .md 并在概述里说明。
 
 ## 其它指令
 
-`/周报` 状态 · `/周报 窗口` 领星下载日期 · `/周报 检查` 文件是否齐全 · `/周报 AI` 只重跑 AI 周报 · `/周报 发送` 重发周报文件
+`/经营周报` 状态 · `/经营周报 窗口` 领星下载日期 · `/经营周报 检查` 文件是否齐全 · `/经营周报 AI` 只重跑 AI 周报 · `/经营周报 发送` 重发周报文件
 
 ## 本地测试
 
 ```bash
-python tools/local_test.py "/周报 测试" "/周报 发送 2026-09-26" "/周报"
+python tools/local_test.py "/经营周报 测试" "/经营周报 发送 2026-09-26" "/经营周报"
 ```
 
 ## 后续

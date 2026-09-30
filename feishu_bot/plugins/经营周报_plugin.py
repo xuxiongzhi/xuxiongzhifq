@@ -1,4 +1,4 @@
-# plugins/周报_plugin.py
+# plugins/经营经营周报_plugin.py
 # 亚马逊周报插件：领星周数据 + SP-API → 周宽表与AI数据包 → AI 生成最终周报 → 周报文件发群 + 概述
 # ────────────────────────────────────────────────────────────────
 #  数据引擎在 plugins/weekly_report/(weekly_pipeline_spapi.py、recognize.py、config.json)，
@@ -10,7 +10,7 @@
 #         测试只用已下载的 SP-API 缓存，不请求亚马逊；每次测试从 inputs 复制，原文件不动，可反复跑。
 #
 #  群里只发 AI 生成的最终周报文件(周报_<周>.md)，结束发一条概述；周宽表/数据包保存在 out/ 备查。
-#  定时：每周五 13:00(北京时间)跑上一周(周日~周六)，默认关闭，领星自动化接入后 /周报 定时 开启。
+#  定时：每周五 13:00(北京时间)跑上一周(周日~周六)，默认关闭，领星自动化接入后 /经营周报 定时 开启。
 # ────────────────────────────────────────────────────────────────
 
 import os
@@ -39,7 +39,7 @@ except Exception:
     _HAS_AI = False
 
 # ── 插件元信息 ─────────────────────────────────────────────────
-TRIGGERS    = ["/周报"]
+TRIGGERS    = ["/经营周报"]
 PRIORITY    = 30
 DESCRIPTION = "亚马逊周报：领星周数据+SP-API合并分析，AI生成周报文件发群并给出概述；每周五13:00可定时"
 
@@ -48,16 +48,16 @@ HELP_EMOJI    = "📊"
 HELP_GROUP    = "亚马逊周报"
 
 HELP_DETAIL = [
-    "/周报              查看进度：本周文件是否齐全、周报是否已生成、定时状态",
-    "/周报 测试 [日期]    用测试文件夹的固定数据跑完整流程(只用SP-API缓存)，发周报+概述",
-    "/周报 窗口          领星各报表该下载哪几天(周日~周六)",
-    "/周报 导入 [日期]    识别 inbox 里的领星文件，改名放进该周文件夹",
-    "/周报 检查 [日期]    检查该周文件是否齐全、订单是否覆盖整周",
-    "/周报 生成 [日期]    正式生成：拉SP-API→合并→AI周报→发文件+概述",
-    "/周报 AI [日期]      只重跑AI周报(数据已生成时)，发文件+概述",
-    "/周报 发送 [日期]    重发该周的AI周报(PDF)",
-    "/周报 绑定          定时周报推送到本群",
-    "/周报 定时 开启|关闭  每周五13:00(北京时间)自动跑上一周",
+    "/经营周报              查看进度：本周文件是否齐全、周报是否已生成、定时状态",
+    "/经营周报 测试 [日期]    用测试文件夹的固定数据跑完整流程(只用SP-API缓存)，发周报+概述",
+    "/经营周报 窗口          领星各报表该下载哪几天(周日~周六)",
+    "/经营周报 导入 [日期]    识别 inbox 里的领星文件，改名放进该周文件夹",
+    "/经营周报 检查 [日期]    检查该周文件是否齐全、订单是否覆盖整周",
+    "/经营周报 生成 [日期]    正式生成：拉SP-API→合并→AI周报→发文件+概述",
+    "/经营周报 AI [日期]      只重跑AI周报(数据已生成时)，发文件+概述",
+    "/经营周报 发送 [日期]    重发该周的AI周报(PDF)",
+    "/经营周报 绑定          定时周报推送到本群",
+    "/经营周报 定时 开启|关闭  每周五13:00(北京时间)自动跑上一周",
 ]
 
 HELP_TIPS = [
@@ -285,9 +285,9 @@ def _send_file(path: str, message_id: str = "", chat_id: str = ""):
 
 def handle(message_id: str, text: str, reply_fn, user_id: str | None = None) -> bool:
     text = (text or "").strip()
-    if not text.startswith("/周报"):
+    if not text.startswith("/经营周报"):
         return False
-    sub, _, arg = text[len("/周报"):].strip().partition(" ")
+    sub, _, arg = text[len("/经营周报"):].strip().partition(" ")
     sub, arg = sub.strip(), arg.strip()
 
     if sub in ("", "状态"):
@@ -526,7 +526,7 @@ def _do_formal(message_id, reply_fn, week_end, chat_id=""):
     ws = WS["正式"]
     man = _load_manifest(ws, week_end)
     if not man:
-        reply_fn(message_id, f"📂 {week_end} 还没有导入文件，请先把领星导出放进 inbox 并发 /周报 导入 {week_end}")
+        reply_fn(message_id, f"📂 {week_end} 还没有导入文件，请先把领星导出放进 inbox 并发 /经营周报 导入 {week_end}")
         return
     if man.get("missing_required"):
         reply_fn(message_id, "❌ 文件不全，无法生成：\n" + _manifest_text(man))
@@ -543,7 +543,7 @@ def _do_formal(message_id, reply_fn, week_end, chat_id=""):
 def _do_ai_only(message_id, reply_fn, week_end):
     ws = WS["正式"]
     if not _pack_path(ws, week_end):
-        reply_fn(message_id, f"📭 {week_end} 还没有生成数据，请先 /周报 生成 {week_end}")
+        reply_fn(message_id, f"📭 {week_end} 还没有生成数据，请先 /经营周报 生成 {week_end}")
         return
     _finish(ws, week_end, reply_fn, message_id, "", time.time())
 
@@ -564,7 +564,7 @@ def _do_resend(message_id, reply_fn, week_end):
             except Exception as e:
                 reply_fn(message_id, f"❌ 发送失败：{e}(文件在 {p})")
             return
-    reply_fn(message_id, f"📭 {week_end} 还没有AI周报，请先 /周报 生成 {week_end}")
+    reply_fn(message_id, f"📭 {week_end} 还没有AI周报，请先 /经营周报 生成 {week_end}")
 
 
 def _do_window(message_id, reply_fn, week_end):
@@ -573,7 +573,7 @@ def _do_window(message_id, reply_fn, week_end):
         reply_fn(message_id, f"❌ 获取窗口失败：\n{_tail(out)}")
         return
     lines = [l for l in out.strip().splitlines() if "放进文件夹" not in l]
-    lines.append(f"  · 文件名随意，放进 {WS['正式']['inbox']} 后发 /周报 导入 {week_end}")
+    lines.append(f"  · 文件名随意，放进 {WS['正式']['inbox']} 后发 /经营周报 导入 {week_end}")
     reply_fn(message_id, "\n".join(lines))
 
 
@@ -581,7 +581,7 @@ def _do_import(message_id, reply_fn, week_end):
     ws = WS["正式"]
     files = [f for f in os.listdir(ws["inbox"]) if os.path.isfile(os.path.join(ws["inbox"], f))]
     if not files:
-        reply_fn(message_id, f"📭 收件箱是空的：{ws['inbox']}\n请把领星导出(和SP-API .bin)放进去再发 /周报 导入")
+        reply_fn(message_id, f"📭 收件箱是空的：{ws['inbox']}\n请把领星导出(和SP-API .bin)放进去再发 /经营周报 导入")
         return
     man, out = _import(ws, ws["inbox"], week_end, copy=False)
     if not man:
@@ -589,7 +589,7 @@ def _do_import(message_id, reply_fn, week_end):
         return
     moved = man.get("last_import", {}).get("moved", [])
     msg = [f"📥 已归档 {len(moved)} 个文件到 {week_end}：" + "、".join(m["type"] for m in moved), _manifest_text(man),
-           "✅ 必需文件齐全，可以发 /周报 生成" if man["ok"] else "⚠️ 补齐标红的文件后再导入"]
+           "✅ 必需文件齐全，可以发 /经营周报 生成" if man["ok"] else "⚠️ 补齐标红的文件后再导入"]
     reply_fn(message_id, "\n".join(msg))
 
 
@@ -655,7 +655,7 @@ def _sched_status() -> str:
 def _sched_cmd(arg: str) -> str:
     if arg == "开启":
         if not _target_chat():
-            return "❌ 还没有推送群：请先在目标群发 /周报 绑定"
+            return "❌ 还没有推送群：请先在目标群发 /经营周报 绑定"
         _write_state({"sched_enabled": True})
         return "✅ " + _sched_status()
     if arg == "关闭":
@@ -722,3 +722,6 @@ def _bootstrap():
 
 if os.environ.get("WEEKLY_REPORT_NO_SCHEDULER") != "1":
     _bootstrap()
+
+logging.info(f"[经营周报] 插件已加载：指令 /经营周报；AI={'可用' if _HAS_AI else '不可用'}；测试周={_latest_test_week() or '无(测试文件夹为空)'}；"
+             + _sched_status())
