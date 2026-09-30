@@ -96,6 +96,9 @@ SCHED_WEEKDAY  = 4          # 周五(Monday=0)
 SCHED_HOUR     = 13         # 北京时间
 SCHED_MINUTE   = 0
 BJ_OFFSET      = timedelta(hours=8)
+READY_MARK     = "_READY"     # 领星采集插件下载完一周的文件后，在 inbox/<周结束日>/ 里建这个空文件
+SCHED_RETRIES  = 4            # 定时任务发现文件没就绪/不全时，每隔 SCHED_RETRY_MIN 分钟再查一次
+SCHED_RETRY_MIN = 30
 
 _run_lock = threading.Lock()
 _running  = {"task": None, "since": None}
@@ -376,6 +379,35 @@ def _import(ws: dict, src: str, week_end: str, copy: bool) -> tuple[dict | None,
              f"SP-API缓存 {len(man.get('spapi_cache', []))} 份；"
              + (f"缺必需：{'、'.join(man['missing_required'])}" if man.get("missing_required") else "必需文件齐全"))
     return man, out
+
+
+def _inbox_src(ws: dict, week_end: str, need_ready: bool = True) -> tuple[str, bool, str]:
+    """领星文件来源：优先 inbox/<周结束日>/(采集插件写入，需 _READY 标记)，否则 inbox 根目录(手动放)。返回 (目录, 可导入, 说明)"""
+    wk = os.path.join(ws["inbox"], week_end)
+    if os.path.isdir(wk):
+        files = [f for f in os.listdir(wk) if not f.startswith("_") and os.path.isfile(os.path.join(wk, f))]
+        if not files:
+            return wk, False, f"{wk} 里还没有文件"
+        if need_ready and not os.path.exists(os.path.join(wk, READY_MARK)):
+            return wk, False, f"采集还没完成({wk} 里没有 {READY_MARK} 标记，已有 {len(files)} 个文件)"
+        return wk, True, f"{wk}(共 {len(files)} 个文件)"
+    top = [f for f in os.listdir(ws["inbox"]) if os.path.isfile(os.path.join(ws["inbox"], f)) and not f.startswith("_")]
+    return ws["inbox"], bool(top), (f"{ws['inbox']}(共 {len(top)} 个文件)" if top else f"收件箱是空的：{ws['inbox']}(或 {wk})")
+
+
+def _after_import(src: str, ws: dict):
+    """周文件夹导入完：删掉 _READY 标记；文件夹空了就删掉(没识别的文件留着，方便排查)"""
+    if os.path.abspath(src) == os.path.abspath(ws["inbox"]):
+        return
+    try:
+        os.remove(os.path.join(src, READY_MARK))
+    except OSError:
+        pass
+    try:
+        if not os.listdir(src):
+            os.rmdir(src)
+    except OSError:
+        pass
 
 
 def _build(ws: dict, week_end: str) -> tuple[bool, str]:
@@ -776,11 +808,13 @@ def _do_window(message_id, reply_fn, week_end):
 
 def _do_import(message_id, reply_fn, week_end):
     ws = WS["正式"]
-    files = [f for f in os.listdir(ws["inbox"]) if os.path.isfile(os.path.join(ws["inbox"], f))]
-    if not files:
-        reply_fn(message_id, f"📭 收件箱是空的：{ws['inbox']}\n请把领星导出(和SP-API .bin)放进去再发 /经营周报 导入")
+    src, ok, why = _inbox_src(ws, week_end, need_ready=False)      # 手动导入不要求 _READY
+    if not ok:
+        reply_fn(message_id, f"📭 {why}\n请把领星导出放进 inbox/{week_end}/ 或 inbox/ 再发 /经营周报 导入 {week_end}")
         return
-    man, out = _import(ws, ws["inbox"], week_end, copy=False)
+    _log(f"[识别] 从 {why} 导入")
+    man, out = _import(ws, src, week_end, copy=False)
+    _after_import(src, ws)
     if not man:
         reply_fn(message_id, f"❌ 识别失败：\n{_tail(out)}")
         return
@@ -867,17 +901,29 @@ def _scheduled_job():
     mid = "scheduler"
     reply = lambda _m, text: _push_text(chat, text)
     ws = WS["正式"]
+    why = ""
+    for attempt in range(SCHED_RETRIES + 1):            # 采集插件可能还没下完：没就绪/不全就隔一段时间再查
+        src, ready, why = _inbox_src(ws, week_end)
+        if ready:
+            _log(f"[定时] 从 {why} 导入 {week_end}")
+            _import(ws, src, week_end, copy=False)
+            _after_import(src, ws)
+        man = _load_manifest(ws, week_end)
+        if man and not man.get("missing_required"):
+            break
+        why = why if not ready else ("缺必需文件：" + "、".join(man.get("missing_required", [])) if man else "没有识别到文件")
+        if attempt < SCHED_RETRIES:
+            _log(f"[定时] {week_end} 第{attempt + 1}次检查未就绪：{why}；{SCHED_RETRY_MIN} 分钟后再查")
+            time.sleep(SCHED_RETRY_MIN * 60)
+    else:
+        reply(mid, f"⚠️ 定时周报 {week_end} 未运行(已等 {SCHED_RETRIES * SCHED_RETRY_MIN} 分钟)：{why}\n"
+                   + (_manifest_text(man) if man else "") + f"\n文件补齐后可手动发 /经营周报 导入 {week_end}，再发 /经营周报 生成 {week_end}")
+        return "文件未就绪"
     if not _run_lock.acquire(blocking=False):
         reply(mid, f"⚠️ 定时周报 {week_end} 跳过：已有任务在运行({_running['task']})")
         return "跳过(有任务在运行)"
     _running.update(task=f"定时 {week_end}", since=datetime.now().strftime("%H:%M:%S"))
     try:
-        if os.listdir(ws["inbox"]):
-            _import(ws, ws["inbox"], week_end, copy=False)
-        man = _load_manifest(ws, week_end)
-        if not man or man.get("missing_required"):
-            reply(mid, f"⚠️ 定时周报 {week_end} 未运行：领星文件不全\n" + (_manifest_text(man) if man else "该周没有任何文件"))
-            return "文件不全"
         _do_formal(mid, reply, week_end, chat_id=chat)
         return "已执行"
     finally:

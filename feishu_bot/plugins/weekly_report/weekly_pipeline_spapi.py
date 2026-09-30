@@ -221,7 +221,7 @@ def num(s):
 
 def find_file(folder, pattern):
     ms = [f for f in glob.glob(os.path.join(folder, "*.xls*"))
-          if pattern in os.path.basename(f) and not os.path.basename(f).startswith("~$")]
+          if pattern in os.path.basename(f) and not os.path.basename(f).startswith("~$") and f.lower().endswith((".xlsx", ".xls"))]   # 不读重新导入留下的 .bak
     return max(ms, key=os.path.getmtime) if ms else None
 
 def style_of(sku):

@@ -10,7 +10,7 @@
 # 输出：data/raw/<周>/manifest.json
 #   {"week_end", "window", "files": {类型: {...}}, "missing_required", "missing_optional", "unknown", "checks", "ok"}
 
-import argparse, glob, json, os, re, shutil, sys, warnings
+import argparse, glob, hashlib, json, os, re, shutil, sys, warnings
 from datetime import datetime, timedelta
 
 warnings.filterwarnings("ignore")
@@ -123,12 +123,12 @@ def _check_orders(path, week_end):
     return ok, (msg if ok else msg + "：没有完整覆盖周窗口，请按窗口重新导出订单")
 
 
-def build_manifest(week_dir, week_end, extra=None):
+def build_manifest(week_dir, week_end, extra=None, extra_checks=None):
     files = {}
     unknown = []
     for f in sorted(glob.glob(os.path.join(week_dir, "*.xls*"))):
-        if os.path.basename(f).startswith("~$"):
-            continue
+        if os.path.basename(f).startswith("~$") or not f.lower().endswith((".xlsx", ".xls")):
+            continue                                   # 跳过 .bak(重新导入时的旧文件备份)
         t, note = classify(f)
         if t:
             if t in files:
@@ -149,6 +149,11 @@ def build_manifest(week_dir, week_end, extra=None):
         checks.append({"item": "快照日一致", "ok": False, "detail": f"快照日不同：{snaps}(库存/在途/本地仓的时间点会错位)"})
     elif snaps:
         checks.append({"item": "快照日一致", "ok": True, "detail": f"快照日 {list(snaps.values())[0]}"})
+    if extra_checks:
+        checks += extra_checks
+    for u in unknown:
+        if "重复" in u.get("note", ""):
+            checks.append({"item": "同类报表重复", "ok": False, "detail": f"{u['file']}：{u['note']}(只会用其中一个；请删掉多余的，或放进收件箱重新导入让程序合并)"})
     cache = sorted(os.path.basename(p) for p in glob.glob(os.path.join(SPAPI_CACHE, f"*_{week_end}.bin")))
     miss_req = [TYPES[k][0] for k, v in TYPES.items() if v[2] and k not in files]
     miss_opt = [TYPES[k][0] for k, v in TYPES.items() if not v[2] and k not in files]
@@ -164,17 +169,57 @@ def build_manifest(week_dir, week_end, extra=None):
     return man
 
 
+def _md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _stores_of(path):
+    """文件里出现的店铺(按第一个工作表的'店铺'/'店铺名称'列)，用来判断多个同类文件是否重复导出"""
+    import pandas as pd
+    try:
+        sheets = pd.ExcelFile(path).sheet_names
+        sh = "货件详情" if "货件详情" in sheets else 0
+        head = _cols(path, sh)
+        col = "店铺" if "店铺" in head else ("店铺名称" if "店铺名称" in head else None)
+        if not col:
+            return set()
+        return set(pd.read_excel(path, sheet_name=sh, usecols=[col])[col].dropna().astype(str).unique())
+    except Exception:
+        return set()
+
+
+def _merge_excels(paths, dst):
+    """同类报表的多个文件(例如按店铺分别导出)按工作表逐个上下拼接成一个文件"""
+    import pandas as pd
+    books = [pd.read_excel(p, sheet_name=None, dtype=object) for p in paths]
+    names = [n for n in books[0]]
+    with pd.ExcelWriter(dst, engine="openpyxl") as w:
+        for n in names:
+            parts = [b[n] for b in books if n in b]
+            pd.concat(parts, ignore_index=True).to_excel(w, sheet_name=n, index=False)
+
+
+def _file_date(path):
+    """文件名里的日期(YYYYMMDD)；没有就用文件修改日期(即下载日期)，不用导入当天"""
+    return _snap_from_name(os.path.basename(path)) or datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y%m%d")
+
+
 def do_import(src, week_end, move=True):
-    """识别 src 里的文件，按标准名放进 raw/<week_end>/；SP-API .bin 放进 spapi_cache。返回 manifest"""
+    """识别 src 里的文件，按标准名放进 raw/<week_end>/；SP-API .bin 放进 spapi_cache。
+    同一类报表有多个文件时(例如两个店铺分别导出)：内容完全相同的只留一个；不同的按工作表拼接成一个文件；同一店铺出现在两个文件里时报警。返回 manifest"""
     week_dir = os.path.join(RAW_ROOT, week_end)
     os.makedirs(week_dir, exist_ok=True)
     os.makedirs(SPAPI_CACHE, exist_ok=True)
-    moved, skipped = [], []
-    today = datetime.now().strftime("%Y%m%d")
+    moved, skipped, merge_checks = [], [], []
+    groups = {}
     for f in sorted(glob.glob(os.path.join(src, "*"))):
         base = os.path.basename(f)
-        if not os.path.isfile(f) or base.startswith("~$"):
-            continue
+        if not os.path.isfile(f) or base.startswith("~$") or base.startswith("_"):
+            continue                                   # _READY 等标记文件
         m = SPAPI_RE.search(base)
         if m:
             dst = os.path.join(SPAPI_CACHE, m.group(0))
@@ -188,14 +233,39 @@ def do_import(src, week_end, move=True):
         if not t:
             skipped.append({"file": base, "note": note})
             continue
-        snap = _snap_from_name(base) or today
-        dst_name = TYPES[t][1].format(snap=snap)
-        dst = os.path.join(week_dir, dst_name)
-        if os.path.exists(dst):
-            os.replace(dst, dst + ".bak")          # 同类旧文件保留一份备份
-        (shutil.move if move else shutil.copy2)(f, dst)
-        moved.append({"src": base, "dst": dst_name, "type": TYPES[t][0], "snapshot_from_name": bool(_snap_from_name(base))})
-    return build_manifest(week_dir, week_end, {"last_import": {"moved": moved, "skipped": skipped}})
+        groups.setdefault(t, []).append(f)
+    for t, fs in groups.items():
+        seen, uniq = {}, []
+        for f in fs:                                   # 完全相同的文件(重复下载)只留一个
+            h = _md5(f)
+            if h in seen:
+                skipped.append({"file": os.path.basename(f), "note": f"与 {os.path.basename(seen[h])} 内容完全相同，已忽略"})
+                if move:
+                    os.remove(f)
+                continue
+            seen[h] = f
+            uniq.append(f)
+        snap = max(_file_date(f) for f in uniq)
+        dst = os.path.join(week_dir, TYPES[t][1].format(snap=snap))
+        for old in glob.glob(os.path.join(week_dir, TYPES[t][1].format(snap="*"))):
+            os.replace(old, old + ".bak")          # 同类旧文件保留一份备份(重新导入时)
+        if len(uniq) == 1:
+            (shutil.move if move else shutil.copy2)(uniq[0], dst)
+        elif t == "cost":
+            (shutil.move if move else shutil.copy2)(uniq[0], dst)
+            merge_checks.append({"item": "成本表重复", "ok": False, "detail": f"有{len(uniq)}个成本表，只用了 {os.path.basename(uniq[0])}，请只放一个"})
+        else:
+            stores = [_stores_of(f) for f in uniq]
+            dup = set.intersection(*stores) if all(stores) else set()
+            _merge_excels(uniq, dst)
+            merge_checks.append({"item": f"{TYPES[t][0]}合并", "ok": not dup,
+                                 "detail": f"{len(uniq)}个文件已拼接" + (f"；店铺 {sorted(dup)} 在多个文件里都有，可能重复导出，数据会翻倍" if dup else f"(店铺：{'、'.join(sorted(set().union(*stores)))})")})
+            if move:
+                for f in uniq:
+                    os.remove(f)
+        moved.append({"src": "、".join(os.path.basename(f) for f in uniq), "dst": os.path.basename(dst), "type": TYPES[t][0],
+                      "snapshot_from_name": all(_snap_from_name(os.path.basename(f)) for f in uniq)})
+    return build_manifest(week_dir, week_end, {"last_import": {"moved": moved, "skipped": skipped}}, merge_checks)
 
 
 def main():
