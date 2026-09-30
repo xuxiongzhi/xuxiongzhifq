@@ -100,7 +100,7 @@ def parent_flags(r, R):
         block.append(f"订单促销占比={pr:.0%}>{R['block_promo_share']:.0%}")
     ss_ = _f(r.get("尺码_缺货占需求比例"))
     if ss_ is not None and ss_ >= R["size_block_share"]:
-        block.append(f"尺码级缺货占60天需求{ss_:.0%}(断码：{r.get('尺码_当前断码') or '-'})")
+        block.append(f"尺码级缺货占60天需求{ss_:.0%}")
     thr = None
     pre = _f(r.get("空运可售前无法避免断货天数"))
     if pre is not None:
@@ -159,7 +159,7 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
         s7 = f"；若近7天日均{d7:.1f}持续，父体级估算需空运{hi7:.0f}件" if hi7 else ""
         if size:
             lost = _f(r.get("尺码_缺货件数_含待交付")) or 0
-            base += (f"；尺码级：当前断码{_f(r.get('尺码_当前断码数')) or 0:.0f}个({r.get('尺码_当前断码') or '-'})，"
+            base += (f"；尺码级：主力尺码当前可售为0共{_f(r.get('尺码_当前断码_主力数')) or 0:.0f}个({r.get('尺码_当前断码') or '-'})，"
                      f"含待交付仍缺{lost:.0f}件(占60天需求{_f(r.get('尺码_缺货占需求比例')) or 0:.0%})，空运前无法避免缺{_f(r.get('尺码_空运前无法避免缺货件数')) or 0:.0f}件")
             air, air_need = _f(r.get("空运_本地可发件数")) or 0, _f(r.get("建议空运件数_尺码合计")) or 0
             sea, sea_need = _f(r.get("海运_本地可发件数")) or 0, _f(r.get("建议海运发货件数_尺码合计")) or 0
