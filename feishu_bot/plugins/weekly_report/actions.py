@@ -137,7 +137,7 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
         c = {"类型": typ, "类型名": TYPE_INFO[typ][1], "执行方式": TYPE_INFO[typ][2],
              "店铺": key[0], "款": (r["款"] if r is not None else ""), "父ASIN": key[1],
              "广告活动": "", "广告组": "", "对象": "", "匹配方式": "", "单位": "",
-             "当前值": None, "建议值": None, "允许范围": None, "规则优先级": "P2", "依据": "", "可选": True, "阻止原因": "",
+             "当前值": None, "建议值": None, "允许范围": None, "规则优先级": "P2", "依据": "", "父体概况": "", "可选": True, "阻止原因": "",
              "_rank": 0.0}
         c.update(kw)
         if typ in UP_TYPES and (fl["block"] or fl["throttle"]):
@@ -155,8 +155,7 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
         d7 = _f(r.get("日均_7天")) or _f(r.get("日均7"))
         base = (f"日均_预测={dmd:.1f}(7/14/30/60天加权；近7天{d7 or 0:.1f})，FBA可售={_f(r.get('FBA可售')) or 0:.0f}，本地可用={loc:.0f}")
         size = r.get("建议空运件数_尺码合计") is not None and _f(r.get("建议空运件数_尺码合计")) is not None
-        hi7 = _f(r.get("建议空运件数_按近7天日均"))
-        s7 = f"；若近7天日均{d7:.1f}持续，父体级估算需空运{hi7:.0f}件" if hi7 else ""
+        hi7 = _f(r.get("建议空运件数_尺码合计_按近7天")) if size else _f(r.get("建议空运件数_按近7天日均"))
         if size:
             lost = _f(r.get("尺码_缺货件数_含待交付")) or 0
             base += (f"；尺码级：主力尺码当前可售为0共{_f(r.get('尺码_当前断码_主力数')) or 0:.0f}个({r.get('尺码_当前断码') or '-'})，"
@@ -165,28 +164,30 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
             sea, sea_need = _f(r.get("海运_本地可发件数")) or 0, _f(r.get("建议海运发货件数_尺码合计")) or 0
             air_txt, sea_txt = r.get("空运尺码明细") or "", r.get("海运尺码明细") or ""
             short_air, short_all = _f(r.get("尺码_空运本地不足件数")) or 0, _f(r.get("尺码_本地仓不足件数")) or 0
+            s7 = f"；若近7天日均{d7:.1f}持续需{hi7:.0f}件" if (hi7 and hi7 > air_need + 0.5) else ""
         else:
             air_need = air = _f(r.get("建议空运件数")) or 0
             sea_need = sea = _f(r.get("建议海运发货件数")) or 0
             air_txt = sea_txt = "父体合计，需按尺码拆分"
+            s7 = f"；若近7天日均{d7:.1f}持续需{hi7:.0f}件" if (hi7 and hi7 > air_need + 0.5) else ""
             short_air, short_all = _f(r.get("空运发货_本地仓不足件数")) or 0, (_f(r.get("空运发货_本地仓不足件数")) or 0) + (_f(r.get("海运发货_本地仓不足件数")) or 0)
         if air >= R["air_min_units"]:
             add("INV_AIR_SHIP", key, 对象="本地仓→FBA 空运", 单位="件", 当前值=0, 建议值=air, 允许范围=[math.ceil(air * 0.8), math.ceil(air * 1.2)],
                 规则优先级="P0" if air >= 3 * R["air_min_units"] else "P1", _rank=1e6 + air,
-                依据=f"{base}；空运第{_f(r.get('空运可售_天后')) or 0:.0f}天可售，撑到海运可售第{_f(r.get('海运可售_天后')) or 0:.0f}天需{air_need:.0f}件，本地仓能发{air:.0f}件：{air_txt}"
+                父体概况=base, 依据=f"空运第{_f(r.get('空运可售_天后')) or 0:.0f}天可售，撑到海运可售第{_f(r.get('海运可售_天后')) or 0:.0f}天需{air_need:.0f}件，本地仓能发{air:.0f}件：{air_txt}"
                      + s7 + (f"；空运前父体仍断货{pre:.0f}天(需同时控速)" if pre else ""))
         if sea >= R["sea_min_units"]:
             add("INV_SEA_SHIP", key, 对象="本地仓→FBA 海运", 单位="件", 当前值=0, 建议值=sea, 允许范围=[sea, math.ceil(sea * 1.2)],
                 规则优先级="P1" if (size and (_f(r.get("尺码_缺货件数_含待交付")) or 0) >= 1) or (_f(r.get("断货天数_含待交付")) or 0) > 0 else "P2", _rank=1e5 + sea,
-                依据=f"{base}；今天海运覆盖到第{_f(r.get('海运发货_覆盖至第N天')) or 0:.0f}天(含发货周期+安全库存)需{sea_need:.0f}件，本地仓能发{sea:.0f}件：{sea_txt}")
+                父体概况=base, 依据=f"今天海运覆盖到第{_f(r.get('海运发货_覆盖至第N天')) or 0:.0f}天(含发货周期+安全库存)需{sea_need:.0f}件，本地仓能发{sea:.0f}件：{sea_txt}")
         if short_all >= R["sea_min_units"]:
             add("PO_SIZE_GAP", key, 对象="本地仓缺的尺码", 单位="件", 当前值=0, 建议值=short_all, 允许范围=[short_all, math.ceil(short_all * 1.3)],
                 规则优先级="P0" if short_air >= R["air_min_units"] else "P1", _rank=1e4 + short_all,
-                依据=f"{base}；本地仓对应尺码不够发 {short_all:.0f} 件(其中空运急需{short_air:.0f}件)：{r.get('尺码_本地仓不足明细') or '-'}；"
+                父体概况=base, 依据=f"本地仓对应尺码不够发 {short_all:.0f} 件(其中空运急需{short_air:.0f}件)：{r.get('尺码_本地仓不足明细') or '-'}；"
                      "先查这些尺码有没有待交付PO可催/工厂直发，没有再新采购")
         late = _f(r.get("待交付_已过预计到货件数")) or 0
         if late > 0:
-            add("PO_FOLLOWUP", key, 对象="工厂待交付PO", 单位="件", 当前值=late, 建议值=None,
+            add("PO_FOLLOWUP", key, 对象="工厂待交付PO", 单位="件", 当前值=late, 建议值=None, 父体概况=base,
                 规则优先级="P1" if (_f(r.get("断货天数_保守")) or 0) > 0 else "P2", _rank=1e4 + late,
                 依据=f"已过预计到货日仍未到 {late:.0f} 件(见3f2)；断货天数_保守={_f(r.get('断货天数_保守')) or 0:.0f}，含待交付={_f(r.get('断货天数_含待交付')) or 0:.0f}(按顺延后的可售日算，实际交期不可信)")
         po_d = _f(r.get("新采购最晚下单_海运_天后"))
@@ -363,7 +364,22 @@ def candidates_md(cands, week_end=""):
             "" if c["当前值"] is None else c["当前值"], "" if c["建议值"] is None else c["建议值"], _range_txt(c), c["单位"],
             c["规则优先级"], c["执行方式"], "是" if c["可选"] else "否", why]) + " |")
     n_ok = sum(c["可选"] for c in cands)
-    return head + f"共 {len(cands)} 条，可选 {n_ok} 条，被阻止 {len(cands) - n_ok} 条。\n\n" + "\n".join(rows) + "\n"
+    return head + parent_md(cands, "### 5a. 库存类候选涉及的父体概况(每个父体只列一次)") + \
+        f"\n### 5b. 候选列表：共 {len(cands)} 条，可选 {n_ok} 条，被阻止 {len(cands) - n_ok} 条。\n\n" + "\n".join(rows) + "\n"
+
+
+def parent_md(items, title):
+    """库存类动作的父体概况(日均、断码、缺货、本地仓)，每个父体只列一次，避免每行重复"""
+    seen, L = {}, []
+    for c in items:
+        if c.get("父体概况") and (c["店铺"], c["款"]) not in seen:
+            seen[(c["店铺"], c["款"])] = c["父体概况"]
+    if not seen:
+        return ""
+    L += [title, "| 店铺/款 | 概况 |", "|---|---|"]
+    for (st, k), v in seen.items():
+        L.append(f"| {st}/{k} | {str(v).replace('|', '/')} |")
+    return "\n".join(L) + "\n"
 
 
 # --------------------------------------------------------------------------- 校验 AI 的选择
@@ -493,9 +509,12 @@ def render_md(res):
             ag = " / ".join(v for v in (x["广告活动"], x["广告组"]) if v)
             L.append("| " + " | ".join(str(v).replace("|", "/").replace("\n", " ") for v in [
                 x["最终优先级"] + (f"({x['备注']})" if x.get("备注") else ""), x["id"], f"{x['店铺']}/{x['款']}", ag, _action_txt(x),
-                x["依据"], x["理由"], x["验证指标"], x["执行方式"]]) + " |")
+                x["依据"], (x["理由"][:80] + "…") if len(x["理由"]) > 80 else x["理由"], x["验证指标"], x["执行方式"]]) + " |")
     else:
         L.append("本周没有通过校验的执行动作。")
+    pm = parent_md(P_, "### 涉及父体的库存概况")
+    if pm:
+        L += ["", pm]
     if res["blocked"]:
         L += ["", "### 被程序拦截的 AI 建议(不执行)", "| ID | 对象 | AI理由 | 拦截原因 |", "|---|---|---|---|"]
         for x in res["blocked"]:
