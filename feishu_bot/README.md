@@ -48,6 +48,12 @@ tools/local_test.py             # 本地模拟(伪造 config/feishu_gateway/ai_r
    八 节表格由程序按校验结果生成(通过 / 被拦截及原因 / 人工事项)，结果存 `out/actions_<周>.json`，以后 Ads API 按名称查 ID 执行。
 4. 阈值在 `config.json` 的 `action_rules` 里覆盖(默认值见 `actions.py` 的 `DEFAULT_RULES`)。
 
+## AI 调用次数
+
+默认一次调用写完整周报(第一部分 + 第二部分)，数据包只提交一次。只有 ai_runner 当前引擎是 anthropic 中转通道时
+(那里 max_tokens=4096，一次写不下)才分两次。一次调用的回复如果缺第二部分(被截断)，只补调一次第二部分。
+可用环境变量 `WEEKLY_REPORT_AI_MODE=single` / `split` 强制。
+
 ## 其它指令
 
 `/经营周报` 状态 · `/经营周报 窗口` 领星下载日期 · `/经营周报 检查` 文件是否齐全 · `/经营周报 AI` 只重跑 AI 周报 · `/经营周报 发送` 重发周报文件

@@ -483,9 +483,29 @@ def _check_actions(ws: dict, week_end: str, part2: str) -> tuple[str, str]:
     return new, note
 
 
+def _ai_mode() -> str:
+    """single=一次调用写完整周报；split=分两次(①数据报告 ②执行建议)。
+    只有 anthropic 中转通道(ai_runner 里 max_tokens=4096)一次写不下完整周报，需要分两次；
+    Claude CLI(Pro 订阅)/Gemini 输出上限够，一次写完，数据包只提交一次。可用环境变量 WEEKLY_REPORT_AI_MODE=single/split 强制。"""
+    forced = os.environ.get("WEEKLY_REPORT_AI_MODE", "").strip().lower()
+    if forced in ("single", "split"):
+        return forced
+    try:
+        engine = ai_runner._get_engine()
+    except Exception:
+        engine = ""
+    return "split" if engine == "anthropic" else "single"
+
+
+_TASK_P1 = ("**第一部分 数据报告**：第一行 `# 亚马逊周报 {we}`，然后按 一~七 写。严格遵守第一原则(没有的数据写'无数据')。"
+            "约4500字以内，表格优先，不复述数据包原文。")
+_TASK_P2 = ("**第二部分 执行建议**：以 `## 第二部分 执行建议` 开头，按 八~十二 写。八 节只能从数据包'5. 候选动作'里选ID，"
+            "只输出一个 ```json 代码块(格式见输出格式)，不要写表格；九~十二 的数字必须与数据包和第一部分一致，不要重复第一部分的内容。约3000字以内。")
+
+
 def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
-    """数据包 → 两次 ai_runner 调用(①数据报告 一~七 ②执行建议 八~十二) → 周报_<周>.md。
-    分两次是因为 ai_runner 单次输出上限(anthropic 通道 4096 tokens)，一次写不下完整周报。返回 (文件路径, 提示/错误)"""
+    """数据包 → ai_runner → 周报_<周>.md。默认一次调用写完两部分；anthropic 通道(输出上限4096 tokens)分两次。
+    一次调用时若第二部分缺失(被截断)，只补调一次第二部分。返回 (文件路径, 提示/错误)"""
     if not _HAS_AI:
         return None, "未找到 ai_runner 模块，无法生成AI周报"
     pack = _pack_path(ws, week_end)
@@ -493,21 +513,34 @@ def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
         return None, "没有找到该周的AI数据包，请先生成数据"
     with open(pack, "r", encoding="utf-8") as f:
         data = f.read()
-    _log(f"[AI] 使用数据包 {os.path.basename(pack)}；分两次调用：①数据报告 ②执行建议")
-    part1, err = _call_ai(data + "\n\n---\n# 本次任务\n只输出**第一部分 数据报告**：第一行 `# 亚马逊周报 " + week_end
-                          + "`，然后按 一~七 写；不要输出第二部分。严格遵守第一原则(没有的数据写'无数据')。全文约4500字以内，表格优先，不复述数据包原文。", "AI①数据报告")
-    if not part1:
-        return None, err
     prev_we, prev = _prev_actions(ws, week_end)
     _log(f"[AI] 上周({prev_we})执行建议：{'已附上，供第十二节复盘' if prev else '没有，第十二节写无'}")
     prev_block = (f"\n\n---\n# 上周({prev_we})AI周报的执行建议清单(供 十二 节逐条评估；无法确认是否执行的写'未知')\n{prev}\n"
                   if prev else "\n\n(没有上周的AI周报，十二 节写'无')\n")
-    part2, err = _call_ai(data + "\n\n---\n# 已写好的第一部分(数据报告)\n" + part1 + prev_block
-                          + "\n---\n# 本次任务\n只输出**第二部分 执行建议**：以 `## 第二部分 执行建议` 开头，按 八~十二 写。"
-                          "八 节只能从数据包'5. 候选动作'里选ID，只输出一个 ```json 代码块(格式见输出格式)，不要写表格；"
-                          "九~十二 的数字必须与数据包和第一部分一致；不要重复第一部分的内容。约3000字以内。", "AI②执行建议")
-    if not part2:
-        return None, "第一部分已生成，但" + err
+    mode = _ai_mode()
+    t1, t2 = _TASK_P1.format(we=week_end), _TASK_P2
+    part1 = part2 = None
+    if mode == "single":
+        _log(f"[AI] 使用数据包 {os.path.basename(pack)}；一次调用写完两部分(数据包只提交一次)")
+        text, err = _call_ai(data + prev_block + "\n---\n# 本次任务\n一次输出完整周报，依次写：\n1. " + t1 + "\n2. " + t2, "AI周报")
+        if not text:
+            return None, err
+        m = re.search(r"(?m)^\s*#{1,3}\s*\**第二部分", text)
+        if m and re.search(r"八、", text[m.start():]):
+            part1, part2 = text[:m.start()].rstrip(), text[m.start():]
+        else:
+            _log("[AI] 回复里没有完整的第二部分(可能被截断)，补调一次只写第二部分", "warning")
+            part1 = text[:m.start()].rstrip() if m else text
+    else:
+        _log(f"[AI] 使用数据包 {os.path.basename(pack)}；分两次调用(anthropic 通道单次输出上限4096 tokens，写不下完整周报)：①数据报告 ②执行建议")
+        part1, err = _call_ai(data + "\n\n---\n# 本次任务\n只输出" + t1 + "不要输出第二部分。", "AI①数据报告")
+        if not part1:
+            return None, err
+    if part2 is None:
+        part2, err = _call_ai(data + "\n\n---\n# 已写好的第一部分(数据报告)\n" + part1 + prev_block
+                              + "\n---\n# 本次任务\n只输出" + t2, "AI②执行建议")
+        if not part2:
+            return None, "第一部分已生成，但" + err
     notes = []
     try:
         part2, act_note = _check_actions(ws, week_end, part2)
@@ -521,7 +554,7 @@ def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
     if not re.search(r"十一、", part2):
         notes.append("第二部分没有写到 十一、，可能被输出长度截断")
     path = _report_path(ws, week_end)
-    head = (f"<!-- 生成：{datetime.now():%Y-%m-%d %H:%M}；数据包：{os.path.basename(pack)}；"
+    head = (f"<!-- 生成：{datetime.now():%Y-%m-%d %H:%M}；数据包：{os.path.basename(pack)}；AI调用：{mode}；"
             f"工作区：{'测试' if ws is WS['测试'] else '正式'} -->\n")
     with open(path, "w", encoding="utf-8") as f:
         f.write(head + part1 + "\n\n" + part2 + "\n")

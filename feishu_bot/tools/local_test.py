@@ -17,7 +17,11 @@ SENT = []
 
 
 def _fake_ai(prompt, timeout=600, model=None):
-    part = 2 if "只输出**第二部分" in prompt else 1
+    part = 2 if "只输出**第二部分" in prompt else (0 if "一次输出完整周报" in prompt else 1)
+    if part == 0:                                   # 一次调用：两部分拼在一起
+        with open(os.path.join(PLUGINS, "weekly_report", "logs", "last_ai_prompt_0.md"), "w", encoding="utf-8") as f:
+            f.write(prompt)
+        return _fake_ai(prompt.replace("一次输出完整周报", "")) + "\n\n" + _fake_ai(prompt + "只输出**第二部分")
     with open(os.path.join(PLUGINS, "weekly_report", "logs", f"last_ai_prompt_{part}.md"), "w", encoding="utf-8") as f:
         f.write(prompt)
     if part == 1:
