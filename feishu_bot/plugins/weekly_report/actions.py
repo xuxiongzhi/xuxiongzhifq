@@ -39,7 +39,9 @@ DEFAULT_RULES = {
     "price_floor_tol": 0.02,         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)         # 实际售价(促销价优先)比竞品最低价高>=5% 才列核价候选              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
     "block_stock_days": 21,          # 含在途天数<21 不加投(提示词硬性规则3)
     "block_promo_share": 0.3,        # 订单促销占比>30% 不加投(提示词硬性规则10)
-    "size_block_share": 0.2,         # 尺码级缺货件数占60天需求>=20% 不加投(主力尺码断货，加投的流量转化不了)
+    "size_block_30d": 0.10,          # 未来30天(含待交付)尺码缺货>=30天需求10% → 硬阻止加投(近期必然缺货，加来的流量落在缺货尺码)
+    "size_block_localgap": 0.05,     # 本地仓对应尺码不足>=60天需求5% → 硬阻止(要靠工厂，短期补不上)
+    "size_soft_share": 0.05,         # 60天尺码缺货>=5%但本地仓能补 → 加投必须同时选该父体的空运/海运候选
     "max_per_type": 15,              # 每类候选最多列多少条(按花费/影响排序)
     "max_blocked_per_type": 5,       # 被阻止的候选每类最多列几条(只为让 AI 知道为什么不动)
     "max_selected": 12,
@@ -107,9 +109,13 @@ def parent_flags(r, R):
     pr = _f(r.get("订单促销占比"))
     if pr is not None and pr > R["block_promo_share"]:
         block.append(f"订单促销占比={pr:.0%}>{R['block_promo_share']:.0%}")
-    ss_ = _f(r.get("尺码_缺货占需求比例"))
-    if ss_ is not None and ss_ >= R["size_block_share"]:
-        block.append(f"尺码级缺货占60天需求{ss_:.0%}")
+    s30, sgap = _f(r.get("尺码_30天缺货占比")), _f(r.get("尺码_本地仓不足占比"))
+    rec = _f(r.get("主力尺码恢复有货_天后"))
+    when = f"主力尺码预计第{rec:.0f}天补齐后再评估" if rec else "主力尺码靠现有在途/待交付60天内补不齐，需先发货或采购"
+    if s30 is not None and s30 >= R["size_block_30d"]:
+        block.append(f"未来30天尺码缺货占需求{s30:.0%}({when})")
+    if sgap is not None and sgap >= R["size_block_localgap"]:
+        block.append(f"本地仓对应尺码不足{_f(r.get('尺码_本地仓不足件数')) or 0:.0f}件(占60天需求{sgap:.0%}，要靠工厂/采购)")
     thr = None
     pre = _f(r.get("空运可售前无法避免断货天数"))
     if pre is not None:
@@ -391,6 +397,7 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
 
     # ---- 排序、截断、编号
     res = []
+    soft = {k for k, r in info.items() if (_f(r.get("尺码_缺货占需求比例")) or 0) >= R["size_soft_share"]}
     for typ, (pre, _, _) in TYPE_INFO.items():
         g = sorted([c for c in out if c["类型"] == typ], key=lambda c: -c["_rank"])
         g = ([c for c in g if c["可选"]][: R["max_per_type"]] + [c for c in g if not c["可选"]][: R["max_blocked_per_type"]])
@@ -398,6 +405,18 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
             c["id"] = f"{pre}{i:02d}"
             c.pop("_rank", None)
             res.append(c)
+    # 条件加投：父体60天有尺码缺货但本地仓能补(没被硬阻止) → 加投类候选必须和该父体的空运/海运候选一起选
+    for c in res:
+        key = (c["店铺"], c["父ASIN"])
+        if c["类型"] in UP_TYPES and c["可选"] and key in soft:
+            dep = [x["id"] for x in res if (x["店铺"], x["父ASIN"]) == key and x["类型"] in ("INV_AIR_SHIP", "INV_SEA_SHIP") and x["可选"]]
+            r = info[key]
+            if dep:
+                c["需同时选"] = dep
+                c["依据"] += f"【前提：本父体60天尺码缺货{(_f(r.get('尺码_缺货占需求比例')) or 0):.0%}，本地仓能补，须同时执行 {'、'.join(dep)}】"
+            else:
+                c["可选"] = False
+                c["阻止原因"] = f"本父体60天尺码缺货{(_f(r.get('尺码_缺货占需求比例')) or 0):.0%}，且没有可执行的发货候选"
     return res
 
 
@@ -521,6 +540,7 @@ def validate(sel, cands, cfg=None):
         k = (x["店铺"], x["父ASIN"], x["广告活动"], x["广告组"], x["对象"])
         obj_dir.setdefault(k, set()).add("up" if x["类型"] in UP_TYPES else ("down" if x["类型"] in DOWN_TYPES else "other"))
     neg_terms = {(x["店铺"], x["父ASIN"], x["对象"]) for x in passed if x["类型"] in ("AD_NEGATIVE", "AD_NEGATIVE_ASIN")}
+    chosen = {x["id"] for x in passed}
     keep = []
     for x in passed:
         why = None
@@ -531,6 +551,8 @@ def validate(sel, cands, cfg=None):
             why = "同一对象同时有加和减的动作"
         elif x["类型"] == "AD_HARVEST" and (x["店铺"], x["父ASIN"], x["对象"]) in neg_terms:
             why = "同一搜索词既要否定又要收割"
+        elif x.get("需同时选") and not set(x["需同时选"]) <= chosen:
+            why = f"该父体有尺码缺货，加投前须先发货：需同时选 {'、'.join(sorted(set(x['需同时选']) - chosen))}"
         if why:
             blocked.append({**x, "状态": "拦截", "原因": "冲突：" + why})
         else:
