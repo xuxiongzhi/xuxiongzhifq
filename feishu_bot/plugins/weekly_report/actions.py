@@ -34,7 +34,9 @@ DEFAULT_RULES = {
     "air_min_units": 10,             # 建议空运件数少于这个数不单独空运(并入海运)；>=3倍时规则优先级P0，否则P1
     "sea_min_units": 5,
     "excess_min_units": 20,          # FBA冗余(或亚马逊冗余)>=此件数才列清货候选；本地滞销>=此件数才列停采/清仓
-    "po_reduce_min_units": 10,              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
+    "po_reduce_min_units": 10,
+    "price_gap_check": 0.05,
+    "price_floor_tol": 0.02,         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)         # 实际售价(促销价优先)比竞品最低价高>=5% 才列核价候选              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
     "block_stock_days": 21,          # 含在途天数<21 不加投(提示词硬性规则3)
     "block_promo_share": 0.3,        # 订单促销占比>30% 不加投(提示词硬性规则10)
     "size_block_share": 0.2,         # 尺码级缺货件数占60天需求>=20% 不加投(主力尺码断货，加投的流量转化不了)
@@ -46,12 +48,14 @@ DEFAULT_RULES = {
 TYPE_INFO = {   # 类型: (ID前缀, 中文名, 执行方式)
     "INV_AIR_SHIP": ("KA", "本地仓空运发FBA", "人工"),
     "INV_SEA_SHIP": ("KS", "本地仓海运发FBA", "人工"),
-    "PO_FOLLOWUP": ("PF", "催交已逾期采购单", "人工"),
+    "PO_FOLLOWUP": ("PO", "催交已逾期采购单", "人工"),
     "PO_NEW": ("PN", "新采购下单", "人工"),
     "PO_SIZE_GAP": ("PG", "尺码缺口：催PO/工厂直发/新采购", "人工"),
     "INV_CLEAR": ("XC", "冗余清货(优惠券/秒杀/降价，不低于保本价)", "人工(需确认)"),
     "PO_REDUCE": ("XP", "削减/延后待交付PO", "人工"),
     "LOCAL_SLOW": ("XL", "本地仓滞销尺码：停止采购/清仓", "人工"),
+    "PRICE_CHECK": ("PC", "核价：实际售价高于竞品最低价", "人工"),
+    "PRICE_FLOOR": ("PF", "促销价低于保本价：上调或结束促销", "人工(需确认)"),
     "AD_THROTTLE": ("CT", "控速：下调活动预算", "API(需确认)"),
     "AD_BUDGET_UP": ("BU", "上调活动预算", "API(需确认)"),
     "AD_BID_UP": ("UP", "提高竞价", "API"),
@@ -212,6 +216,7 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
         sto = _f(r.get("冗余_预估月仓储费")) or 0
         ctx = (f"日均_预测={_f(r.get('日均_预测')) or 0:.1f}，FBA可售={_f(r.get('FBA可售')) or 0:.0f}；库龄91天以上{a91:.0f}件、181天以上{a181:.0f}件；"
                f"当前价{price or 0:.2f}、保本价{be_p or 0:.2f}")
+        pp = [(m_, float(v_)) for m_, v_ in re.findall(r"([^、\s]+) ([\d.]+)", r.get("促销价明细") or "")]
         if max(exf, amz) >= R["excess_min_units"]:
             q = round(exf if exf >= R["excess_min_units"] else amz)
             amz_txt = r.get("亚马逊建议促销明细") or ""
@@ -223,7 +228,21 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
             add("INV_CLEAR", key, 对象="冗余尺码", 单位="件", 当前值=0, 建议值=q, 允许范围=[math.ceil(q * 0.5), math.ceil(q * 1.2)],
                 规则优先级="P1" if (a181 > 0 or sto >= 50) else "P2", _rank=5e3 + q, 父体概况=ctx,
                 依据=f"FBA冗余{exf:.0f}件(超{int((cfg or {}).get('excess_fba_days', 90))}天销量)：{(r.get('冗余_FBA明细') or '-')[:160]}；亚马逊估算冗余{amz:.0f}件；"
-                     f"冗余尺码下月预估仓储费${sto:.0f}{low}；促销价不得低于保本价")
+                     f"冗余尺码下月预估仓储费${sto:.0f}{low}"
+                     + (f"；已有{len(pp)}个尺码在促销(最低{min(v_ for _, v_ in pp):.2f})，先看促销效果再加码" if pp else "") + "；促销价不得低于保本价")
+        promo = r.get("促销价明细") or ""
+        pp = [(m_, float(v_)) for m_, v_ in re.findall(r"([^、\s]+) ([\d.]+)", promo)]
+        if pp and be_p:
+            below = [(m_, v_) for m_, v_ in pp if v_ < be_p * (1 - R["price_floor_tol"])]
+            if below:
+                add("PRICE_FLOOR", key, 对象="促销中的尺码", 单位="个SKU", 当前值=len(below), 建议值=None, 规则优先级="P1", _rank=6e3 + len(below), 父体概况=ctx,
+                    依据=f"促销价低于保本价{be_p:.2f}(不含广告与仓储费)：" + "、".join(f"{m_} {v_:.2f}" for m_, v_ in below[:10]) +
+                         "；若是有意清滞销/冗余尺码可保留，否则上调促销价或结束促销")
+        gap = _f(r.get("SP_价格高于竞品最低价比例"))
+        if gap is not None and gap >= R["price_gap_check"]:
+            add("PRICE_CHECK", key, 对象="价格", 单位="%", 当前值=round(gap * 100, 1), 建议值=None, 规则优先级="P2", _rank=2e3 + gap, 父体概况=ctx,
+                依据=f"实际售价(促销价优先){_f(r.get('SP_我方实际售价')) or 0:.2f} 比竞品最低价{_f(r.get('SP_竞品最低价')) or 0:.2f} 高{gap:.1%}；"
+                     f"全站转化率{_f(r.get('全站转化率')) or 0:.1%}；核对竞品是否同款同规格后再决定是否调价(不得低于保本价)")
         po_cut = _f(r.get("冗余_可削减PO件数")) or 0
         if po_cut >= R["po_reduce_min_units"]:
             add("PO_REDUCE", key, 对象="待交付PO中冗余的尺码", 单位="件", 当前值=_f(r.get("待交付")) or 0, 建议值=round(po_cut),

@@ -155,7 +155,7 @@ SP_COLS = ["SP_流量覆盖天数", "SP_流量截止日", "SP_会话", "SP_页�
            "SP_SQP周期", "SP_SQP曝光", "SP_SQP点击", "SP_SQP加购", "SP_SQP购买", "SP_SQP查询数", "SP_SQP覆盖ASIN数",
            "SP_退货件数", "SP_退货率", "SP_退货原因Top3",
            "SP_库龄90天以上件数", "SP_库龄181天以上件数", "SP_预估仓储费", "SP_预估长期仓储费",
-           "SP_我方价格", "SP_精选报价价格", "SP_精选报价为我方", "SP_竞品最低价", "SP_价格高于竞品最低价比例"]
+           "SP_我方价格", "SP_我方实际售价", "SP_促销中SKU数", "SP_最低促销价", "SP_精选报价价格", "SP_精选报价为我方", "SP_竞品最低价", "SP_价格高于竞品最低价比例"]
 SP_DOC = {
     "SP_会话": "销售与流量报告(PARENT粒度)：sessions", "SP_页面浏览": "销售与流量报告：pageViews",
     "SP_订购件数": "销售与流量报告：unitsOrdered，可与领星'销量7'对账", "SP_订购销售额": "销售与流量报告：orderedProductSales(已折USD)",
@@ -168,11 +168,13 @@ SP_DOC = {
     "SP_退货原因Top3": "FBA退货报告：退货原因前三及件数", "SP_库龄90天以上件数": "库存计划报告：库龄>90天件数(91-180天+181天以上)",
     "SP_库龄181天以上件数": "库存计划报告：库龄>=181天件数(2026年起进入长期仓储附加费区间)",
     "SP_预估仓储费": "库存计划报告：下月预估月度仓储费合计(USD)", "SP_预估长期仓储费": "库存计划报告：下次预估长期仓储附加费合计(USD)",
-    "SP_我方价格": "库存计划报告：your-price(我方当前报价，不含促销/优惠券)在子体间的均值(USD)；'价格高于竞品最低价比例'以它为分子",
+    "SP_我方价格": "库存计划报告：your-price(我方标价，不含促销)在子体间的均值(USD)",
+    "SP_我方实际售价": "逐子体：有促销价(sales-price，低于标价)时用促销价，否则用标价，再取均值(USD)；'价格高于竞品最低价比例'以它为分子",
+    "SP_促销中SKU数": "sales-price 低于标价的子体数(正在促销/降价)", "SP_最低促销价": "促销中子体的最低促销价(USD)，与 保本价 比较",
     "SP_精选报价价格": "库存计划报告：featuredoffer-price(Buy Box 精选报价)在子体间的均值(USD)；可能是别的卖家或我方的促销价，不能和竞品最低价直接比出'我方贵多少'",
     "SP_精选报价为我方": "0-1，子体中'精选报价价格=我方价格'的比例(近似；Buy Box以SP_BuyBox占比为准)",
     "SP_竞品最低价": "库存计划报告：lowest-price-new-plus-shipping 均值(USD，可能包含我方自己的报价)",
-    "SP_价格高于竞品最低价比例": "SP_我方价格(your-price)÷竞品最低价-1，先逐子体算再取均值(0.1=高10%)；<=0表示我方即最低或无更低报价。和精选报价无关"}
+    "SP_价格高于竞品最低价比例": "逐子体 我方实际售价(促销价优先)÷最低价-1 的均值(0.1=高10%)；<=0表示我方即最低。注意：最低价(lowest-price-new-plus-shipping)常常就是我方自己的促销价，用标价去比会误判为'比竞品贵'"}
 
 SP_DOC.update(SP_DERIVED_DOC)
 SP_DOC.update({
@@ -1206,7 +1208,7 @@ def _parse_planning(text, L_store, cfg, fx_default, store=None):
     """GET_FBA_INVENTORY_PLANNING_DATA：库龄、预估仓储费、竞品价。各列名随站点/账号可能不同，缺列则该项留空。"""
     x = _read_tsv(text)
     cols = ["父ASIN", "SP_库龄90天以上件数", "SP_库龄181天以上件数", "SP_预估仓储费", "SP_预估长期仓储费",
-            "SP_我方价格", "SP_精选报价价格", "SP_精选报价为我方", "SP_竞品最低价", "SP_价格高于竞品最低价比例"]
+            "SP_我方价格", "SP_我方实际售价", "SP_促销中SKU数", "SP_最低促销价", "SP_精选报价价格", "SP_精选报价为我方", "SP_竞品最低价", "SP_价格高于竞品最低价比例"]
     if x.empty:
         return pd.DataFrame(columns=cols), 0
     x = _attach_parent(x, L_store)
@@ -1232,21 +1234,30 @@ def _parse_planning(text, L_store, cfg, fx_default, store=None):
     x["_sto"] = n("estimated-storage-cost-next-month") * rate
     x["_lt"] = n("estimated-ltsf-next-charge") * rate
     your, feat, low = n("your-price") * rate, n("featuredoffer-price") * rate, n("lowest-price-new-plus-shipping") * rate
+    sale = n("sales-price") * rate
+    onsale = (sale > 0) & (your > 0) & (sale < your - 0.005)
+    eff = sale.where(onsale, your)                      # 实际售价：有促销价用促销价
     x["_your"] = your.where(your > 0)
+    x["_eff"] = eff.where(eff > 0)
+    x["_onsale"] = onsale.astype(float)
+    x["_sale"] = sale.where(onsale)
     x["_feat"] = feat.where(feat > 0)
     x["_low"] = low.where(low > 0)
-    x["_own"] = ((feat - your).abs() <= 0.01).astype(float).where(feat > 0)
-    x["_gap"] = (your / low - 1).where((your > 0) & (low > 0))
+    x["_own"] = (((feat - eff).abs() <= 0.01) | ((feat - your).abs() <= 0.01)).astype(float).where(feat > 0)   # 精选报价=我方促销价或标价 都算我方
+    x["_gap"] = (eff / low - 1).where((eff > 0) & (low > 0))
+    x.loc[x["_gap"].abs() < 0.005, "_gap"] = 0.0
     if store and "sku" in x.columns:
         PLANNING_SKU[store] = pd.DataFrame({
             "MSKU": x["sku"].astype(str), "库龄91天以上": x["_a91"], "库龄181天以上": x["_a181"],
             "亚马逊冗余件数": n("estimated-excess-quantity"), "亚马逊建议": x["recommended-action"] if has("recommended-action") else None,
             "亚马逊建议价": (n("recommended-sales-price") * rate).where(lambda v: v > 0), "预估月仓储费": x["_sto"],
+            "标价": x["_your"], "促销价": x["_sale"],
             "库存健康": x["fba-inventory-level-health-status"] if has("fba-inventory-level-health-status") else None})
     s = lambda c: (lambda v: v.sum(min_count=1))
     g = x.groupby("_p").agg(SP_库龄90天以上件数=("_a91", s("")), SP_库龄181天以上件数=("_a181", s("")),
                             SP_预估仓储费=("_sto", s("")), SP_预估长期仓储费=("_lt", s("")),
-                            SP_我方价格=("_your", "mean"), SP_精选报价价格=("_feat", "mean"), SP_精选报价为我方=("_own", "mean"),
+                            SP_我方价格=("_your", "mean"), SP_我方实际售价=("_eff", "mean"), SP_促销中SKU数=("_onsale", "sum"),
+                            SP_最低促销价=("_sale", "min"), SP_精选报价价格=("_feat", "mean"), SP_精选报价为我方=("_own", "mean"),
                             SP_竞品最低价=("_low", "mean"), SP_价格高于竞品最低价比例=("_gap", "mean")).reset_index()
     return g.rename(columns={"_p": "父ASIN"})[cols], bad
 
@@ -2058,7 +2069,8 @@ def sku_supply(P, replen, ship, po, snap, cfg, q):
               "60天零销量": bool((r["60天销量"] or 0) == 0 and (S0 + pool_own) > 0),
               "FBA库存天数": (S0 + inb) / d if d > 0 else np.nan, "总库存天数": (S0 + inb + pos + pool_own) / d if d > 0 else np.nan,
               "库龄91天以上": pl.get("库龄91天以上"), "库龄181天以上": pl.get("库龄181天以上"), "亚马逊冗余件数": pl.get("亚马逊冗余件数"),
-              "亚马逊建议": pl.get("亚马逊建议"), "亚马逊建议价": pl.get("亚马逊建议价"), "预估月仓储费": pl.get("预估月仓储费")}
+              "亚马逊建议": pl.get("亚马逊建议"), "亚马逊建议价": pl.get("亚马逊建议价"), "预估月仓储费": pl.get("预估月仓储费"),
+              "标价": pl.get("标价"), "促销价": pl.get("促销价")}
         ex["可削减PO件数"] = min(pos, ex["总冗余件数"])
         if not (d > 0):
             if S0 + inb + pos + pool_own > 0:
@@ -2123,6 +2135,8 @@ def sku_supply(P, replen, ship, po, snap, cfg, q):
                     "亚马逊冗余件数": float(pd.to_numeric(g["亚马逊冗余件数"], errors="coerce").fillna(0).sum()),
                     "亚马逊建议促销明细": "、".join(f"{short(m_)} 建议价{p_:.2f}" for m_, a_, p_ in zip(g["MSKU"], g["亚马逊建议"], g["亚马逊建议价"])
                                               if str(a_) in ("Create sale", "Lower price", "Create Outlet deal") and pd.notna(p_))[:300],
+                    "促销价明细": "、".join(f"{short(m_)} {v_:.2f}" for m_, v_ in sorted(
+                        [(m_, float(v_)) for m_, v_ in zip(g["MSKU"], pd.to_numeric(g["促销价"], errors="coerce")) if pd.notna(v_)], key=lambda t_: t_[1])),
                     "冗余_预估月仓储费": float(pd.to_numeric(g.loc[g["FBA冗余件数"] > 0, "预估月仓储费"], errors="coerce").fillna(0).sum())})
     P = P.merge(pd.DataFrame(agg), on=["店铺", "父ASIN"], how="left")
     bad = P[P["尺码_缺货件数_含待交付"].fillna(0) >= 1].sort_values("尺码_缺货件数_含待交付", ascending=False)
@@ -2761,7 +2775,7 @@ PROMPT = """# 角色与任务
 ### 5.3 流量与转化：会话、全站转化率、广告点击占会话、自然会话估算、Buy Box
 ### 5.4 退货与退款：退货件数、退货率、退货原因(按规则只引用件数>=3的原因)
 ### 5.5 库存与补货：分"缺货"与"冗余/滞销"两块写。缺货：断货模拟、尺码级缺货(3e3)、在途与到仓、工厂待交付、空运/海运件数；冗余/滞销(3e4)：FBA冗余件数、总冗余、可削减PO、滞销SKU与件数(FBA/本地仓)、库龄91+/181+、预估月仓储费、亚马逊冗余与建议价 vs 保本价；新SKU观察数只说明，不当滞销
-### 5.6 价格与竞争：精选报价、竞品最低价、价格高于竞品比例(无数据写无数据)
+### 5.6 价格与竞争：我方实际售价(促销价优先)、促销中SKU数、最低促销价 vs 保本价、竞品最低价、价格高于竞品比例(以实际售价算；最低价常是我方促销价，比例<=0 不得写成"比竞品贵")(无数据写无数据)
 ## 六、板块交叉对比：表格 交叉信号|本期表现|验证结果(成立/部分成立/不成立/无法验证)|根因
 ## 七、最该关注的3个问题与最该抓住的3个机会：每条带数字
 
@@ -3097,7 +3111,7 @@ def cmd_pack(a, cfg):
     md.append("## 2b. 本周 vs 上周(按广告花费降序)\n" + md_table(chg))
     md.append("## 3. 各父体逐周明细(周结束升序)\n" + md_table(long, ["店铺", "款", "周结束"] + tcols))
     spc = ["SP_流量覆盖天数", "SP_会话", "全站转化率", "SP_单位会话率", "SP_BuyBox占比", "SP_搜索曝光", "SP_搜索点击率", "SP_搜索转化率", "SP_搜索购买", "SP_搜索周期", "SP_订购件数", "SP_退货件数", "SP_退货率", "SP_退货原因Top3",
-           "SP_库龄90天以上件数", "SP_库龄181天以上件数", "SP_预估仓储费", "标价", "SP_我方价格", "SP_精选报价价格", "SP_精选报价为我方", "SP_竞品最低价", "SP_价格高于竞品最低价比例", "SP_SQP周期"]
+           "SP_库龄90天以上件数", "SP_库龄181天以上件数", "SP_预估仓储费", "标价", "SP_我方价格", "SP_我方实际售价", "SP_促销中SKU数", "SP_最低促销价", "保本价", "SP_精选报价价格", "SP_精选报价为我方", "SP_竞品最低价", "SP_价格高于竞品最低价比例", "SP_SQP周期"]
     spc = [c for c in spc if c in P.columns]
     spl = P[P["周结束"] == latest]
     spl = spl[spl[[c for c in spc if c.startswith("SP_")]].notna().any(axis=1)] if spc else spl.iloc[0:0]
@@ -3130,9 +3144,10 @@ def cmd_pack(a, cfg):
     if len(spl):
         spc_used = [c for c in spc if spl[c].notna().any()]          # 全空的列(如默认关闭的搜索漏斗/SQP)不占篇幅
         md.append("## 3b. SP-API 数据(最新一周，按广告花费降序)\n"
-                  "价格口径：标价=领星Listing标价；SP_我方价格=库存计划报告 your-price(我方当前报价)；SP_精选报价价格=Buy Box 精选报价(可能是别家或促销价)；"
-                  "SP_竞品最低价=新品最低价含运费(可能就是我方)；SP_价格高于竞品最低价比例 = SP_我方价格÷竞品最低价−1(逐子体再平均)。"
-                  "比较'我方贵不贵'只能用 SP_我方价格 与 SP_竞品最低价，不得用精选报价去比。\n" + md_table(spl.sort_values("广告花费", ascending=False, na_position="last"), ["店铺", "款"] + spc_used))
+                  "价格口径：标价=领星Listing标价；SP_我方价格=库存计划报告 your-price(标价)；SP_我方实际售价=有促销价(sales-price)用促销价，否则标价；"
+                  "SP_竞品最低价=新品最低价含运费——常常就是我方自己的促销价；SP_精选报价价格=Buy Box 精选报价(等于我方促销价或标价即为我方)；"
+                  "SP_价格高于竞品最低价比例 = 我方实际售价÷最低价−1(逐子体再平均)，<=0 表示我方就是最低价。判断'贵不贵'只能用这个比例，不得用标价去比；"
+                  "SP_最低促销价 低于 保本价 表示有尺码在亏本促销。\n" + md_table(spl.sort_values("广告花费", ascending=False, na_position="last"), ["店铺", "款"] + spc_used))
     if len(SPH):
         wins = [(datetime.strptime(latest, "%Y-%m-%d") - timedelta(days=7 * k_)).strftime("%Y-%m-%d") for k_ in range(len(ws) if len(ws) > 1 else a.weeks)][::-1]
         sp_h = SPH[SPH["窗口结束"].isin(wins)].copy()
