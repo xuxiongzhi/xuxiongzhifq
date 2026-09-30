@@ -491,24 +491,31 @@ def _check_actions(ws: dict, week_end: str, part2: str) -> tuple[str, str]:
         cj = json.load(f)
     sel, span = ACT.extract_json(part2)
     rec = {"week_end": week_end, "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "candidates": os.path.basename(cpath)}
-    if sel is None:
-        _log("[校验] AI 没有按格式输出 JSON，执行清单未校验", "warning")
-        rec.update(status="未校验", reason="AI 没有输出可解析的 JSON", passed=[], blocked=[], manual=[])
-        note = "⚠️ AI 没有按格式输出执行清单 JSON，八 节未经程序校验，不能用于自动执行"
-        new = part2
+    bad_json = sel is None
+    if bad_json:        # JSON 缺失/被截断：候选照样全部按规则列入，只是没有 AI 理由
+        _log("[校验] AI 没有输出可解析的 JSON，执行清单按规则全部列入(无 AI 理由)", "warning")
+        sel = {"执行清单": []}
+    res = ACT.validate(sel, cj["candidates"], {"action_rules": cj.get("rules") or {}})
+    rec.update(status="已校验(AI JSON 无法解析，按规则列入)" if bad_json else "已校验", **res)
+    _log(f"[校验] 执行清单：列入 {len(res['passed'])} 条(规则补入 {sum(1 for x in res['passed'] if x.get('规则补入'))} 条)，"
+         f"拦截 {len(res['blocked'])} 条，人工事项 {len(res['manual'])} 条")
+    for x in res["blocked"]:
+        _log(f"[校验] {x.get('状态', '拦截')} {x.get('id') or '-'}：{x['原因']}")
+    table = ACT.render_md(res)
+    m = re.search(r"(?ms)^\s*#{1,3}\s*\**八、.*?(?=^\s*#{1,3}\s*\**九、|\Z)", part2)
+    if m and (bad_json or m.start() <= span[0] < m.end()):
+        new = part2[:m.start()] + table + "\n" + part2[m.end():]
+    elif not bad_json:
+        new = part2[:span[0]] + table + part2[span[1]:]
     else:
-        res = ACT.validate(sel, cj["candidates"], {"action_rules": cj.get("rules") or {}})
-        rec.update(status="已校验", **res)
-        _log(f"[校验] 执行清单：通过 {len(res['passed'])} 条，拦截 {len(res['blocked'])} 条，人工事项 {len(res['manual'])} 条")
-        for x in res["blocked"]:
-            _log(f"[校验] 拦截 {x.get('id') or '-'}：{x['原因']}")
-        table = ACT.render_md(res)
-        m = re.search(r"(?ms)^\s*#{1,3}\s*\**八、.*?(?=^\s*#{1,3}\s*\**九、|\Z)", part2)
-        if m and m.start() <= span[0] < m.end():
-            new = part2[:m.start()] + table + "\n" + part2[m.end():]
-        else:
-            new = part2[:span[0]] + table + part2[span[1]:]
-        note = f"执行清单通过校验 {len(res['passed'])} 条" + (f"，拦截 {len(res['blocked'])} 条(原因见周报 八 节)" if res["blocked"] else "")
+        m9 = re.search(r"(?m)^\s*#{1,3}\s*\**九、", part2)
+        new = (part2[:m9.start()] + table + "\n" + part2[m9.start():]) if m9 else (part2.rstrip() + "\n\n" + table)
+    n_auto = sum(1 for x in res["passed"] if x.get("规则补入"))
+    n_bl = sum(1 for x in res["blocked"] if x.get("状态") != "修正")
+    note = f"执行清单 {len(res['passed'])} 条" + (f"(其中 {n_auto} 条 AI 未选、按规则列入)" if n_auto else "") + \
+           (f"，拦截 {n_bl} 条(原因见周报 八 节)" if n_bl else "")
+    if bad_json:
+        note = "⚠️ AI 没有按格式输出执行清单 JSON，八 节已按规则全部列入(没有 AI 理由)；" + note
     with open(_actions_path(ws, week_end), "w", encoding="utf-8") as f:
         json.dump(ACT.to_jsonable(rec), f, ensure_ascii=False, indent=1)
     _log(f"[校验] 已保存 {_actions_path(ws, week_end)}")
@@ -671,11 +678,19 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
     try:
         with open(_actions_path(ws, week_end), "r", encoding="utf-8") as f:
             aj = json.load(f)
-        if aj.get("status") == "已校验":
+        if str(aj.get("status", "")).startswith("已校验"):
             ACT = _engine_mod("actions")
-            ps, bl = aj.get("passed") or [], aj.get("blocked") or []
-            lines.append(f"· 执行清单：通过校验 {len(ps)} 条" + (f"，拦截 {len(bl)} 条" if bl else "") + ("，前3条：" if ps else ""))
-            for x in ps[:3]:
+            ps = aj.get("passed") or []
+            bl = [x for x in (aj.get("blocked") or []) if x.get("状态") != "修正"]
+            cnt = {}
+            for x in ps:
+                cnt[x["最终优先级"]] = cnt.get(x["最终优先级"], 0) + 1
+            n_auto = sum(1 for x in ps if x.get("规则补入"))
+            p0 = [x for x in ps if x["最终优先级"] == "P0"]
+            lines.append(f"· 执行清单 {len(ps)} 条(" + "/".join(f"{k} {cnt[k]}" for k in sorted(cnt)) + ")" +
+                         (f"，其中 {n_auto} 条 AI 未选、按规则列入" if n_auto else "") + (f"，拦截 {len(bl)} 条" if bl else "") +
+                         ("；P0：" if p0 else ("；前3条：" if ps else "")))
+            for x in (p0 or ps[:3]):
                 lines.append(f"  {x['最终优先级']} {x['id']} {x['款']}：{ACT._action_txt(x)}"[:140])
             report = ""                           # 已用校验结果，不再解析 AI 原文表格
     except FileNotFoundError:

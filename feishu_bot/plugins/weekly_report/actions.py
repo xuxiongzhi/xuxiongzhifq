@@ -45,7 +45,6 @@ DEFAULT_RULES = {
     "size_soft_share": 0.05,         # 60天尺码缺货>=5%但本地仓能补 → 加投必须同时选该父体的空运/海运候选
     "max_per_type": 15,              # 每类候选最多列多少条(按花费/影响排序)
     "max_blocked_per_type": 5,       # 被阻止的候选每类最多列几条(只为让 AI 知道为什么不动)
-    "max_selected": 12,
 }
 
 TYPE_INFO = {   # 类型: (ID前缀, 中文名, 执行方式)
@@ -574,8 +573,8 @@ def validate(sel, cands, cfg=None):
                 blocked.append({**rec, "状态": "拦截", "原因": f"建议值不是数字：{it.get('建议值')}"})
                 continue
             elif not (lo - 1e-9 <= v <= hi + 1e-9):
-                blocked.append({**rec, "状态": "拦截", "原因": f"建议值{v}超出允许范围{lo}~{hi}"})
-                continue
+                blocked.append({**rec, "状态": "修正", "原因": f"AI建议值{v}超出允许范围{lo}~{hi}，已按规则建议值{c['建议值']}列入清单"})
+                v = c["建议值"]
         else:
             v = c["建议值"]
         rec["最终值"] = v
@@ -587,35 +586,58 @@ def validate(sel, cands, cfg=None):
             note.append(f"AI优先级{rec['AI优先级']}与规则{c['规则优先级']}相差超过一级，已调为{p}")
         rec["最终优先级"], rec["备注"] = p, "；".join(note)
         passed.append(rec)
-    # ---- 冲突：同父体既控速/否定又加投；同对象既加又减
-    par_down = {(x["店铺"], x["父ASIN"]) for x in passed if x["类型"] == "AD_THROTTLE"}
-    obj_dir = {}
-    for x in passed:
-        k = (x["店铺"], x["父ASIN"], x["广告活动"], x["广告组"], x["对象"])
-        obj_dir.setdefault(k, set()).add("up" if x["类型"] in UP_TYPES else ("down" if x["类型"] in DOWN_TYPES else "other"))
-    neg_terms = {(x["店铺"], x["父ASIN"], x["对象"]) for x in passed if x["类型"] in ("AD_NEGATIVE", "AD_NEGATIVE_ASIN")}
-    chosen = {x["id"] for x in passed}
+    # ---- 执行清单没有条数上限：可选的候选全部列入，AI 没选的按规则默认值补入(AI 可调优先级和建议值，不能漏项)
+    ai_ids = {x["id"] for x in passed}
+    for c in cands:
+        if c["可选"] and c["id"] not in ai_ids:
+            passed.append({"id": c["id"], "AI优先级": "", "AI建议值": None, "理由": "", "验证指标": "", **c,
+                           "最终值": c["建议值"], "最终优先级": c["规则优先级"], "备注": "", "规则补入": True})
+    # ---- 冲突：同父体既控速/否定又加投；同对象既加又减(AI 所选优先，规则补入的与之冲突时不列入)
+    def _conf(x, pool):
+        """x 与 pool 里的动作冲突时返回原因"""
+        kf = lambda z: (z["店铺"], z["父ASIN"], z["广告活动"], z["广告组"], z["对象"], z.get("匹配方式") or "")    # 同一关键词不同匹配方式是不同投放
+        k = kf(x)
+        dirs = {"up" if y["类型"] in UP_TYPES else ("down" if y["类型"] in DOWN_TYPES else "other")
+                for y in pool if kf(y) == k}
+        me = "up" if x["类型"] in UP_TYPES else ("down" if x["类型"] in DOWN_TYPES else "other")
+        thr = {(y["店铺"], y["父ASIN"]) for y in pool if y["类型"] == "AD_THROTTLE"}
+        if x["类型"] in UP_TYPES and (x["店铺"], x["父ASIN"]) in thr:
+            return "同一父体已选控速，不能同时加投"
+        if x["类型"] == "AD_THROTTLE" and any(y["类型"] in UP_TYPES and (y["店铺"], y["父ASIN"]) == (x["店铺"], x["父ASIN"]) for y in pool):
+            return "同一父体已选加投，不能同时控速"
+        if me in ("up", "down") and ({"up", "down"} - {me}) & dirs:
+            return "同一对象同时有加和减的动作"
+        negs = {(y["店铺"], y["父ASIN"], y["对象"]) for y in pool if y["类型"] in ("AD_NEGATIVE", "AD_NEGATIVE_ASIN")}
+        if x["类型"] == "AD_HARVEST" and (x["店铺"], x["父ASIN"], x["对象"]) in negs:
+            return "同一搜索词既要否定又要收割"
+        if x["类型"] in ("AD_NEGATIVE", "AD_NEGATIVE_ASIN") and any(y["类型"] == "AD_HARVEST" and (y["店铺"], y["父ASIN"], y["对象"]) == (x["店铺"], x["父ASIN"], x["对象"]) for y in pool):
+            return "同一搜索词既要否定又要收割"
+        return None
+    # AI 所选之间互相冲突 → 都按原规则拦截；规则补入的与已列入的冲突 → 不列入
+    ai_ = [x for x in passed if not x.get("规则补入")]
+    auto_ = [x for x in passed if x.get("规则补入")]
     keep = []
-    for x in passed:
-        why = None
-        k = (x["店铺"], x["父ASIN"], x["广告活动"], x["广告组"], x["对象"])
-        if x["类型"] in UP_TYPES and (x["店铺"], x["父ASIN"]) in par_down:
-            why = "同一父体已选控速，不能同时加投"
-        elif {"up", "down"} <= obj_dir.get(k, set()):
-            why = "同一对象同时有加和减的动作"
-        elif x["类型"] == "AD_HARVEST" and (x["店铺"], x["父ASIN"], x["对象"]) in neg_terms:
-            why = "同一搜索词既要否定又要收割"
-        elif x.get("需同时选") and not set(x["需同时选"]) <= chosen:
-            why = f"该父体有尺码缺货，加投前须先发货：需同时选 {'、'.join(sorted(set(x['需同时选']) - chosen))}"
+    for x in ai_:
+        why = _conf(x, [y for y in ai_ if y is not x])
         if why:
             blocked.append({**x, "状态": "拦截", "原因": "冲突：" + why})
         else:
             keep.append({**x, "状态": "通过", "原因": ""})
-    keep.sort(key=lambda x: PRIO.index(x["最终优先级"]))
-    if len(keep) > R["max_selected"]:
-        for x in keep[R["max_selected"]:]:
-            blocked.append({**x, "状态": "拦截", "原因": f"超过每周最多{R['max_selected']}条"})
-        keep = keep[: R["max_selected"]]
+    for x in auto_:
+        why = _conf(x, keep)
+        if why:
+            blocked.append({**x, "状态": "未列入", "原因": "规则补入的候选与已选动作冲突：" + why})
+        else:
+            keep.append({**x, "状态": "通过", "原因": ""})
+    chosen = {x["id"] for x in keep}
+    k2 = []
+    for x in keep:                                      # 加投的前提发货候选必须也在清单里
+        if x.get("需同时选") and not set(x["需同时选"]) <= chosen:
+            blocked.append({**x, "状态": "拦截", "原因": f"冲突：该父体有尺码缺货，加投前须先发货：需同时选 {'、'.join(sorted(set(x['需同时选']) - chosen))}"})
+        else:
+            k2.append(x)
+    keep = k2
+    keep.sort(key=lambda x: (PRIO.index(x["最终优先级"]), bool(x.get("规则补入")), -float(x.get("_rank") or 0)))
     manual = [m for m in manual if isinstance(m, dict)]
     # 人工事项不得绕过规则：被阻止加投的父体，人工事项里写加价/加预算/收割/新建手动词 → 拦截
     stopped = {}
@@ -632,7 +654,7 @@ def validate(sel, cands, cfg=None):
                             "原因": f"{hit[0]} 被规则阻止加投({stopped[hit[0]][:60]}…)，人工事项不能绕过"})
         else:
             keep_m.append(m)
-    # 人工事项里不能放候选(候选要么进执行清单，要么在九写暂缓原因)，否则绕过了校验和条数上限
+    # 人工事项里不能放候选(候选已全部列入执行清单)，否则同一动作出现两次且绕过校验
     ids = {c["id"] for c in cands}
     keep_m2 = []
     for m in keep_m:
@@ -640,7 +662,7 @@ def validate(sel, cands, cfg=None):
         hit = [i for i in re.findall(r"(?<![A-Za-z0-9])([A-Z]{2}\d{2})(?!\d)", txt) if i in ids]
         if hit:
             blocked.append({"id": "人工事项", "对象": m.get("对象", ""), "理由": m.get("理由", ""), "状态": "拦截",
-                            "原因": f"{'、'.join(hit)} 是候选，要么放进执行清单，要么在九说明暂缓原因，不能放人工事项"})
+                            "原因": f"{'、'.join(hit)} 是候选，已在执行清单里，不能再放人工事项"})
         else:
             keep_m2.append(m)
     return {"passed": keep, "blocked": blocked, "manual": keep_m2}
@@ -666,7 +688,7 @@ def _action_txt(x):
 
 def render_md(res):
     """八 节：由校验结果生成的执行清单(代替 AI 原文的 JSON)"""
-    L = ["## 八、执行建议清单(AI 从规则候选中选择，已经程序校验)"]
+    L = ["## 八、执行建议清单(规则候选全部列入，不设条数上限；AI 调整优先级/建议值并写理由，已经程序校验)"]
     P_ = res["passed"]
     if P_:
         L += ["| 优先级 | ID | 店铺/款 | 广告活动 / 广告组 | 动作 | 规则依据 | AI理由 | 验证指标 | 执行方式 |", "|---|---|---|---|---|---|---|---|---|"]
@@ -674,14 +696,15 @@ def render_md(res):
             ag = " / ".join(v for v in (x["广告活动"], x["广告组"]) if v)
             L.append("| " + " | ".join(str(v).replace("|", "/").replace("\n", " ") for v in [
                 x["最终优先级"] + (f"({x['备注']})" if x.get("备注") else ""), x["id"], f"{x['店铺']}/{x['款']}", ag, _action_txt(x),
-                x["依据"], (x["理由"][:80] + "…") if len(x["理由"]) > 80 else x["理由"], x["验证指标"], x["执行方式"]]) + " |")
+                x["依据"], ((x["理由"][:80] + "…") if len(x["理由"]) > 80 else x["理由"]) or ("(AI未选，按规则列入)" if x.get("规则补入") else ""),
+                x["验证指标"], x["执行方式"]]) + " |")
     else:
         L.append("本周没有通过校验的执行动作。")
     pm = parent_md(P_, "### 涉及父体的库存概况")
     if pm:
         L += ["", pm]
     if res["blocked"]:
-        L += ["", "### 被程序拦截的 AI 建议(不执行)", "| ID | 对象 | AI理由 | 拦截原因 |", "|---|---|---|---|"]
+        L += ["", "### 程序拦截或修正的项", "| ID | 对象 | AI理由 | 原因 |", "|---|---|---|---|"]
         for x in res["blocked"]:
             obj = f"{x.get('店铺', '')}/{x.get('款', '')} {x.get('对象', '')}".strip(" /")
             L.append("| " + " | ".join(str(v).replace("|", "/").replace("\n", " ") for v in [x["id"] or "-", obj or "-", x.get("理由", ""), x["原因"]]) + " |")
