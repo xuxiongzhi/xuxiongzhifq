@@ -37,7 +37,8 @@ DEFAULT_RULES = {
     "aged_fee_urgent_units": 5,      # aged_fee_urgent_days(默认90天)内就会过收费线(服装271天)的件数>=此值 → 清货P1(紧急)；否则P2(预警)
     "po_reduce_min_units": 10,
     "price_gap_check": 0.05,         # 实际售价(促销价优先)比竞品最低价高>=5% 才列核价候选
-    "price_floor_tol": 0.02,         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)
+    "price_floor_tol": 0.02,
+    "monitor_p0_days": 90,           # 零销量/停售库存 距库龄收费线<=90天 → P0；<=150天 → P1；更远 → P2         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)
     "block_stock_days": 21,          # 含在途天数<21 不加投(提示词硬性规则3)
     "block_promo_share": 0.3,        # 订单促销占比>30% 不加投(提示词硬性规则10)
     "size_block_30d": 0.10,          # 未来30天(含待交付)尺码缺货>=30天需求10% → 硬阻止加投(近期必然缺货，加来的流量落在缺货尺码)
@@ -58,6 +59,10 @@ TYPE_INFO = {   # 类型: (ID前缀, 中文名, 执行方式)
     "PO_REDUCE": ("XP", "削减/延后待交付PO", "人工"),
     "LOCAL_SLOW": ("XL", "本地仓滞销尺码：停止采购/清仓", "人工"),
     "PRICE_CHECK": ("PC", "核价：实际售价高于竞品最低价", "人工"),
+    "MON_NO_SALE": ("MN", "零销量排查：到FBA满30天仍0单", "人工"),
+    "MON_INACTIVE": ("MI", "停售子体仍有FBA库存：重新激活或移除", "人工"),
+    "MON_CLIFF": ("MC", "销量断崖排查(有货却连续14天0单)", "人工"),
+    "MON_DROP": ("MP", "父体销量骤降排查(有货)", "人工"),
     "PRICE_FLOOR": ("PF", "促销价低于保本价：上调或结束促销", "人工(需确认)"),
     "AD_THROTTLE": ("CT", "控速：下调活动预算", "API(需确认)"),
     "AD_BUDGET_UP": ("BU", "上调活动预算", "API(需确认)"),
@@ -281,6 +286,33 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
             add("LOCAL_SLOW", key, 对象="本地仓滞销尺码", 单位="件", 当前值=sl, 建议值=None, 规则优先级="P3", _rank=3e3 + sl, 父体概况=ctx,
                 依据=f"开售与到FBA都满45天、近30天零销量的尺码：{r.get('滞销明细') or '-'}(含FBA {(_f(r.get('滞销_FBA件数')) or 0):.0f}件、本地仓{sl:.0f}件)；"
                      "停止采购这些尺码，本地仓可考虑清仓/捆绑，不要再发FBA")
+
+    # ---- 硬性监控：按距库龄收费线的天数定优先级(不等亚马逊标记收费)
+    def _lvl(days):
+        if days is None:
+            return "P1"
+        return "P0" if days <= R["monitor_p0_days"] else ("P1" if days <= R["monitor_p0_days"] + 60 else "P2")
+    for key, r in info.items():
+        n0, d0 = _f(r.get("监控_零销量SKU数")) or 0, _f(r.get("监控_零销量最近期限_天"))
+        if n0 > 0:
+            add("MON_NO_SALE", key, 对象="零销量尺码", 单位="件", 当前值=_f(r.get("监控_零销量件数")) or 0, 建议值=None,
+                规则优先级=_lvl(d0), _rank=9e5 - (d0 or 999),
+                依据=f"{r.get('监控_零销量明细')}；到FBA满30天仍0单。先查：Listing是否可搜到/被抑制、变体是否挂在父体下、主图/尺码表、价格；"
+                     f"{'距收费线已不足' + format(d0, '.0f') + '天，查完无果就降价清货或移除' if d0 is not None and d0 <= R['monitor_p0_days'] else '限期内给广告测款或降价'}")
+        n1, d1 = _f(r.get("监控_停售有库存SKU数")) or 0, _f(r.get("监控_停售有库存最近期限_天"))
+        if n1 > 0:
+            add("MON_INACTIVE", key, 对象="停售子体", 单位="件", 当前值=_f(r.get("监控_停售有库存件数")) or 0, 建议值=None,
+                规则优先级=_lvl(d1), _rank=8e5 - (d1 or 999),
+                依据=f"{r.get('监控_停售有库存明细')}；Listing停售但FBA还有货，卖不出去且照收仓储费/库龄费：能卖就重新激活，不卖就建移除订单")
+        n2 = _f(r.get("监控_销量断崖SKU数")) or 0
+        if n2 > 0:
+            add("MON_CLIFF", key, 对象="销量断崖尺码", 单位="件", 当前值=_f(r.get("监控_销量断崖件数")) or 0, 建议值=None,
+                规则优先级="P1", _rank=7e5,
+                依据=f"{r.get('监控_销量断崖明细')}；近30天有销量、近14天0单且有货(不是断货)。查：该子体是否被抑制/变体被拆、Buy Box、差评、价格是否被改、广告是否停投")
+        dr = r.get("监控_父体销量骤降") or ""
+        if isinstance(dr, str) and dr:
+            add("MON_DROP", key, 对象="父体销量", 单位="", 当前值=None, 建议值=None, 规则优先级="P1", _rank=6e5,
+                依据=f"{dr}；查：Listing状态、Buy Box、评分变化、价格/促销是否结束、广告预算是否用完或被暂停、是否被跟卖")
 
     # ---- 控速(预算)与加预算：活动级，最新一周
     if C is not None and len(C):
@@ -606,6 +638,8 @@ def validate(sel, cands, cfg=None):
 def _action_txt(x):
     t = x["类型"]
     v = x.get("最终值")
+    if t.startswith("MON_"):
+        return x["类型名"] + (f"({x['当前值']:.0f} 件)" if x.get("当前值") else "")
     if t == "LOCAL_SLOW":
         return f"{x['类型名']}({x['当前值']:.0f} 件)"
     if t in ("INV_AIR_SHIP", "INV_SEA_SHIP", "PO_NEW", "PO_SIZE_GAP", "INV_CLEAR", "PO_REDUCE"):

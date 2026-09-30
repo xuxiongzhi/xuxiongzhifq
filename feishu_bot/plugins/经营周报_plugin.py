@@ -641,6 +641,16 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
                                  + (f"，冗余部分月仓储费约 ${P['冗余_预估月仓储费'].sum():.0f}" if "冗余_预估月仓储费" in P.columns else "") + "：" + "、".join(
                         f"{r['款']} {r['冗余_FBA件数']:.0f}" for _, r in ex.head(5).iterrows())
                         + (f"；滞销尺码(满45天、近30天零销量) FBA {P['滞销_FBA件数'].sum():.0f} 件、本地仓 {P['滞销_本地件数'].sum():.0f} 件" if "滞销_FBA件数" in P.columns else ""))
+            if "监控_零销量SKU数" in P.columns:          # 硬性监控：零销量/停售有库存/销量断崖
+                mz = []
+                for col, name in (("监控_零销量", "零销量"), ("监控_停售有库存", "停售有库存"), ("监控_销量断崖", "销量断崖")):
+                    h = P[P[col + "SKU数"].fillna(0) > 0]
+                    if len(h):
+                        dl = h[col + "最近期限_天"].min()
+                        mz.append(f"{name} {int(h[col + 'SKU数'].sum())}个SKU/{h[col + '件数'].sum():.0f}件"
+                                  + (f"(最近距收费线{dl:.0f}天)" if pd.notna(dl) and name != "销量断崖" else ""))
+                if mz:
+                    lines.append("· 🚨 硬性监控：" + "；".join(mz))
             only = P[(P["断货天数_保守"].fillna(0) > 0) & (P["断货天数_含待交付"].fillna(0) == 0)]
             if len(only):
                 lines.append("· 待交付按时到才不断货：" + "、".join(only["款"].astype(str).head(5)) + "(要盯PO交期)")
