@@ -32,12 +32,12 @@ DEFAULT_RULES = {
     "harvest_min_orders": 2,
     "harvest_min_clicks": 5,         # 只有1~2次点击的"出单词"多是7天归因带来的，不收割
     "air_min_units": 10,             # 建议空运件数少于这个数不单独空运(并入海运)；>=3倍时规则优先级P0，否则P1
-    "sea_min_units": 5,
-    "excess_min_units": 20,
-    "aged_p1_units": 50,             # 卖出前会过181天库龄线的件数>=50(或已有过线库存、冗余仓储费>=$50)时清货为P1          # FBA冗余(或亚马逊冗余)>=此件数才列清货候选；本地滞销>=此件数才列停采/清仓
+    "sea_min_units": 5,              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
+    "excess_min_units": 20,          # 冗余/库龄风险/亚马逊冗余>=此件数才列清货候选；本地滞销>=此件数才列停采/清仓
+    "aged_fee_p1_units": 20,         # 卖出前会过收费线(服装271天)的件数>=此值，且 aged_fee_urgent_days 天内就开始过线 → 清货P1(紧急)；否则P2(预警)
     "po_reduce_min_units": 10,
-    "price_gap_check": 0.05,
-    "price_floor_tol": 0.02,         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)         # 实际售价(促销价优先)比竞品最低价高>=5% 才列核价候选              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
+    "price_gap_check": 0.05,         # 实际售价(促销价优先)比竞品最低价高>=5% 才列核价候选
+    "price_floor_tol": 0.02,         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)
     "block_stock_days": 21,          # 含在途天数<21 不加投(提示词硬性规则3)
     "block_promo_share": 0.3,        # 订单促销占比>30% 不加投(提示词硬性规则10)
     "size_block_30d": 0.10,          # 未来30天(含待交付)尺码缺货>=30天需求10% → 硬阻止加投(近期必然缺货，加来的流量落在缺货尺码)
@@ -224,8 +224,13 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
         ctx = (f"日均_预测={_f(r.get('日均_预测')) or 0:.1f}，FBA可售={_f(r.get('FBA可售')) or 0:.0f}；库龄91天以上{a91:.0f}件、181天以上{a181:.0f}件；"
                f"当前价{price or 0:.2f}、保本价{be_p or 0:.2f}")
         pp = [(m_, float(v_)) for m_, v_ in re.findall(r"([^、\s]+) ([\d.]+)", r.get("促销价明细") or "")]
-        cross = _f(r.get("库龄_卖出前将满181天件数")) or 0
+        cross = _f(r.get("库龄_卖出前将满181天件数")) or 0          # 预警线
+        cross_fee = _f(r.get("库龄_卖出前将满收费线件数")) or 0      # 收费线(服装271天)
         aged = _f(r.get("库龄_已满181天件数")) or 0
+        fee_d = int((cfg or {}).get("aged_fee_days", 271))
+        urg_d = int((cfg or {}).get("aged_fee_urgent_days", 90))
+        first_fee = _f(r.get("库龄_首批过收费线_天后"))
+        urgent = cross_fee >= R["aged_fee_p1_units"] and first_fee is not None and first_fee <= urg_d
         if max(exf, amz, cross + aged) >= R["excess_min_units"]:
             base_q = max(exf, cross + aged)            # 已满181天的也要清
             q = round(base_q if base_q >= R["excess_min_units"] else amz)   # 清货量取 冗余 与 卖出前会过库龄线 的较大者
@@ -236,8 +241,11 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
                 if ps and min(ps) < be_p:
                     low = f"；亚马逊建议价最低{min(ps):.2f}低于保本价{be_p:.2f}，不宜照做"
             add("INV_CLEAR", key, 对象="冗余尺码", 单位="件", 当前值=0, 建议值=q, 允许范围=[math.ceil(q * 0.5), math.ceil(q * 1.2)],
-                规则优先级="P1" if (aged > 0 or cross >= R["aged_p1_units"] or sto >= 50) else "P2", _rank=5e3 + q, 父体概况=ctx,
-                依据=f"按先进先出，卖出前会满181天(开始收库龄附加费)的有{cross:.0f}件：{(r.get('库龄风险明细') or '-')[:140]}"
+                规则优先级="P1" if (urgent or sto >= 50) else "P2", _rank=5e3 + q + (1e4 if urgent else 0), 父体概况=ctx,
+                依据=((f"【紧急】{first_fee:.0f}天内就有货过{fee_d}天收费线(服装库龄附加费)，卖出前会过线{cross_fee:.0f}件；" if first_fee else f"【紧急】已有货过{fee_d}天收费线，卖出前会过线{cross_fee:.0f}件；") if urgent
+                      else (f"【仓储费高】冗余部分月仓储费约${sto:.0f}≥$50；" if sto >= 50 else "")
+                      + (f"【预警】约第{first_fee:.0f}天才开始过{fee_d}天收费线(卖出前会过线{cross_fee:.0f}件)，先停补货、小幅促销；" if cross_fee > 0 and first_fee else "【预警】"))
+                     + f"卖出前会满181天(预警线，留约90天清货)的有{cross:.0f}件：{(r.get('库龄风险明细') or '-')[:140]}"
                      + (f"；已满181天{aged:.0f}件" if aged else "")
                      + f"；FBA在库冗余{exf:.0f}件(超{int((cfg or {}).get('excess_fba_days', 90))}天销量)；亚马逊估算冗余{amz:.0f}件；"
                      f"冗余部分下月仓储费约${sto:.0f}(按冗余件数分摊)"
