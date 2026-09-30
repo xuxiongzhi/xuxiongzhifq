@@ -434,6 +434,55 @@ def _call_ai(prompt: str, label: str = "AI") -> tuple[str | None, str]:
     return text, ""
 
 
+def _engine_mod(name: str):
+    """按文件加载 weekly_report/ 下的模块(render_pdf、actions)，不污染店铺后端的 sys.path"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(f"wr_{name}", os.path.join(ENGINE_DIR, f"{name}.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _actions_path(ws: dict, week_end: str) -> str:
+    return os.path.join(ws["out"], f"actions_{week_end}.json")
+
+
+def _check_actions(ws: dict, week_end: str, part2: str) -> tuple[str, str]:
+    """校验 AI 在 八 节选的候选动作：ID 存在、未被规则阻止、数值在允许范围、无冲突。
+    用校验结果生成 八 节表格替换 AI 的 JSON，结果存 actions_<周>.json。返回 (新的第二部分, 提示)"""
+    cpath = os.path.join(ws["out"], f"candidates_{week_end}.json")
+    if not os.path.exists(cpath):
+        _log("[校验] 没有候选动作文件，跳过校验", "warning")
+        return part2, "⚠️ 没有候选动作文件，执行清单未经程序校验"
+    ACT = _engine_mod("actions")
+    with open(cpath, "r", encoding="utf-8") as f:
+        cj = json.load(f)
+    sel, span = ACT.extract_json(part2)
+    rec = {"week_end": week_end, "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "candidates": os.path.basename(cpath)}
+    if sel is None:
+        _log("[校验] AI 没有按格式输出 JSON，执行清单未校验", "warning")
+        rec.update(status="未校验", reason="AI 没有输出可解析的 JSON", passed=[], blocked=[], manual=[])
+        note = "⚠️ AI 没有按格式输出执行清单 JSON，八 节未经程序校验，不能用于自动执行"
+        new = part2
+    else:
+        res = ACT.validate(sel, cj["candidates"], {"action_rules": cj.get("rules") or {}})
+        rec.update(status="已校验", **res)
+        _log(f"[校验] 执行清单：通过 {len(res['passed'])} 条，拦截 {len(res['blocked'])} 条，人工事项 {len(res['manual'])} 条")
+        for x in res["blocked"]:
+            _log(f"[校验] 拦截 {x.get('id') or '-'}：{x['原因']}")
+        table = ACT.render_md(res)
+        m = re.search(r"(?ms)^\s*#{1,3}\s*\**八、.*?(?=^\s*#{1,3}\s*\**九、|\Z)", part2)
+        if m and m.start() <= span[0] < m.end():
+            new = part2[:m.start()] + table + "\n" + part2[m.end():]
+        else:
+            new = part2[:span[0]] + table + part2[span[1]:]
+        note = f"执行清单通过校验 {len(res['passed'])} 条" + (f"，拦截 {len(res['blocked'])} 条(原因见周报 八 节)" if res["blocked"] else "")
+    with open(_actions_path(ws, week_end), "w", encoding="utf-8") as f:
+        json.dump(ACT.to_jsonable(rec), f, ensure_ascii=False, indent=1)
+    _log(f"[校验] 已保存 {_actions_path(ws, week_end)}")
+    return new, note
+
+
 def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
     """数据包 → 两次 ai_runner 调用(①数据报告 一~七 ②执行建议 八~十二) → 周报_<周>.md。
     分两次是因为 ai_runner 单次输出上限(anthropic 通道 4096 tokens)，一次写不下完整周报。返回 (文件路径, 提示/错误)"""
@@ -455,10 +504,18 @@ def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
                   if prev else "\n\n(没有上周的AI周报，十二 节写'无')\n")
     part2, err = _call_ai(data + "\n\n---\n# 已写好的第一部分(数据报告)\n" + part1 + prev_block
                           + "\n---\n# 本次任务\n只输出**第二部分 执行建议**：以 `## 第二部分 执行建议` 开头，按 八~十二 写。"
-                          "每条建议的数字必须与数据包和第一部分一致；不要重复第一部分的内容。约3500字以内。", "AI②执行建议")
+                          "八 节只能从数据包'5. 候选动作'里选ID，只输出一个 ```json 代码块(格式见输出格式)，不要写表格；"
+                          "九~十二 的数字必须与数据包和第一部分一致；不要重复第一部分的内容。约3000字以内。", "AI②执行建议")
     if not part2:
         return None, "第一部分已生成，但" + err
     notes = []
+    try:
+        part2, act_note = _check_actions(ws, week_end, part2)
+        if act_note.startswith("⚠️"):
+            notes.append(act_note[2:].strip())
+    except Exception as e:
+        _log(f"[校验] 失败：{e}", "error")
+        notes.append(f"执行清单校验出错：{e}")
     if not re.search(r"七、", part1):
         notes.append("第一部分没有写到 七、，可能被输出长度截断")
     if not re.search(r"十一、", part2):
@@ -486,7 +543,17 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
             acos = f"{r['广告花费'] / r['广告销售']:.1%}" if r["广告销售"] else "-"
             tacos = f"{r['广告花费'] / r['销售额7']:.1%}" if r["销售额7"] else "-"
             lines.append(f"· {s}：销量 {r['销量7']:.0f}，销售额 ${r['销售额7']:,.0f}，广告 ${r['广告花费']:,.0f}，ACoS {acos}，TACoS {tacos}")
-        if "断货天数_保守" in P.columns:
+        if "断货天数_含待交付" in P.columns:      # 有补货数据：按"已下单的货都算上仍断货"报，只看FBA+在途会夸大(如PO能接上的款)
+            risk = P[P["断货天数_含待交付"].fillna(0) > 0].sort_values("首次断货_含待交付_天后")
+            if len(risk):
+                lines.append("· 断货风险(含工厂待交付仍断货)：" + "、".join(
+                    f"{r['款']}(第{int(r['首次断货_含待交付_天后'])}天起{int(r['断货天数_含待交付'])}天"
+                    + (f"，空运也补不上{int(r['空运可售前无法避免断货天数'])}天" if r.get("空运可售前无法避免断货天数", 0) > 0 else "") + ")"
+                    for _, r in risk.head(5).iterrows()))
+            only = P[(P["断货天数_保守"].fillna(0) > 0) & (P["断货天数_含待交付"].fillna(0) == 0)]
+            if len(only):
+                lines.append("· 待交付按时到才不断货：" + "、".join(only["款"].astype(str).head(5)) + "(要盯PO交期)")
+        elif "断货天数_保守" in P.columns:
             risk = P[P["断货天数_保守"].fillna(0) > 0].sort_values("首次断货_天后")
             if len(risk):
                 lines.append("· 断货风险：" + "、".join(f"{r['款']}(第{int(r['首次断货_天后'])}天)" for _, r in risk.head(5).iterrows()))
@@ -501,11 +568,27 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
     except Exception:
         pass
     try:
-        with open(report, "r", encoding="utf-8") as f:
-            act = _sec(f.read(), "八、", "九、")
+        with open(_actions_path(ws, week_end), "r", encoding="utf-8") as f:
+            aj = json.load(f)
+        if aj.get("status") == "已校验":
+            ACT = _engine_mod("actions")
+            ps, bl = aj.get("passed") or [], aj.get("blocked") or []
+            lines.append(f"· 执行清单：通过校验 {len(ps)} 条" + (f"，拦截 {len(bl)} 条" if bl else "") + ("，前3条：" if ps else ""))
+            for x in ps[:3]:
+                lines.append(f"  {x['最终优先级']} {x['id']} {x['款']}：{ACT._action_txt(x)}"[:140])
+            report = ""                           # 已用校验结果，不再解析 AI 原文表格
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        lines.append(f"· 执行清单读取失败：{e}")
+    try:                                          # 没有校验结果(旧周报/AI 未按格式)时，退回解析 AI 原文表格
+        act = ""
+        if report:
+            with open(report, "r", encoding="utf-8") as f:
+                act = _sec(f.read(), "八、", "九、")
         rows = [l for l in act.splitlines() if l.strip().startswith("|") and not re.match(r"^\s*\|[\s:|-]+\|\s*$", l)][1:]
         if rows:
-            lines.append(f"· 执行建议 {len(rows)} 条，前3条：")
+            lines.append(f"· 执行建议 {len(rows)} 条(未经程序校验)，前3条：")
             for l in rows[:3]:
                 cells = [c.strip() for c in l.strip().strip("|").split("|")]
                 lines.append("  " + " | ".join(c for c in cells[:3] if c)[:140])
@@ -513,17 +596,13 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
         pass
     if note:
         lines.append(note)
-    lines.append(f"完整周报见附件 {os.path.basename(sent or report)}；用时 {secs // 60} 分 {secs % 60} 秒")
+    lines.append(f"完整周报见附件 {os.path.basename(sent or _report_path(ws, week_end))}；用时 {secs // 60} 分 {secs % 60} 秒")
     return "\n".join(lines)
 
 
 def _to_pdf(md_path: str) -> str:
     """周报 .md → .html + .pdf(weekly_report/render_pdf.py，用本机 Chrome/Edge 打印)。失败抛异常"""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("wr_render_pdf", os.path.join(ENGINE_DIR, "render_pdf.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.md_file_to_pdf(md_path)
+    return _engine_mod("render_pdf").md_file_to_pdf(md_path)
 
 
 def _finish(ws, week_end, reply_fn, message_id, chat_id, t0) -> None:

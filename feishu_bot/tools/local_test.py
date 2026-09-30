@@ -1,14 +1,14 @@
 # tools/local_test.py
 # 本地模拟飞书调用周报插件(不需要网关/店铺后端/飞书/AI)：
 #   - 伪造 config / feishu_gateway / ai_runner 三个上层模块
-#   - 伪造的 ai_runner 返回一份固定格式的周报(A~E节)，并把收到的 prompt 存到 logs/ 供检查
+#   - 伪造的 ai_runner 返回固定格式的周报；第二部分从候选动作里选ID(故意混入错误)，检验插件校验；prompt 存到 logs/ 供检查
 #   - 发文件改为打印(不请求飞书)
 # 真实 AI 内容需在机器人里用 /经营周报 测试 验证。
 #
 # 用法：
 #   python tools/local_test.py "/经营周报 测试" "/经营周报 发送 2026-09-26" "/经营周报"
 
-import json, os, sys, threading, time, types
+import json, os, re, sys, threading, time, types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGINS = os.path.join(ROOT, "plugins")
@@ -23,11 +23,23 @@ def _fake_ai(prompt, timeout=600, model=None):
     if part == 1:
         return ("# 亚马逊周报(模拟AI输出)\n\n## 第一部分 数据报告\n## 一、执行摘要\n(模拟)\n## 二、分析口径\n## 三、核心指标总览\n## 四、本期最异常指标\n"
                 "## 五、板块分析\n## 六、板块交叉对比\n## 七、最该关注的3个问题与3个机会\n(模拟)")
-    return ("## 第二部分 执行建议\n## 八、执行建议清单\n| 优先级 | 对象 | 动作 | 依据数据 | 预期影响 | 时限 | 验证指标 | 置信度 |\n|---|---|---|---|---|---|---|---|\n"
-            "| P0 | tangliuquan-US/ZJCY076 | 本地仓空运175件 | 第13天断货 | 避免断货 | 今日 | 可售天数 | 中 |\n"
-            "| P0 | tangliuquan-US/ZJTX073 | 本周海运发59件 | 第39天断货 | 避免断货 | 本周 | 发货单 | 中 |\n"
-            "| P1 | tangliuquan-US/ZJPL065 | 降价清库龄 | 库存262天 | 降仓储费 | 本周 | 库存天数 | 低 |\n"
-            "## 九、暂不动作\n## 十、需要人工确认的操作\n## 十一、数据限制与缺口\n## 十二、相对上周的判断修正\n无\n")
+    # 第二部分：从数据包"5. 候选动作"里挑 ID 输出 JSON，并故意混入几种错误，检验插件的校验能否拦住
+    rows = re.findall(r"(?m)^\| ([A-Z]{2}\d{2}) \|.*\| (是|否) \| [^|]*\|$", prompt)
+    ok = [i for i, y in rows if y == "是"]
+    bad = [i for i, y in rows if y == "否"]
+    pick = lambda pre: next((i for i in ok if i.startswith(pre)), None)
+    sel = [{"id": pick("KA"), "优先级": "P0", "理由": "(模拟)空运前断货", "验证指标": "下周FBA可售"},
+           {"id": pick("CT"), "优先级": "P0", "理由": "(模拟)控速", "验证指标": "日均销量"},
+           {"id": pick("KS"), "优先级": "P1", "理由": "(模拟)海运", "验证指标": "发货单"},
+           {"id": pick("UP"), "优先级": "P2", "建议值": 9.99, "理由": "(模拟错误)超出允许范围", "验证指标": "ACoS"},
+           {"id": pick("TD"), "优先级": "P0", "理由": "(模拟错误)样本不足却给P0", "验证指标": "点击"},
+           {"id": "NG99", "优先级": "P2", "理由": "(模拟错误)否定不在候选里的词", "验证指标": "-"}]
+    sel += [{"id": i, "优先级": "P1", "理由": "(模拟错误)断货父体加投", "验证指标": "-"} for i in bad[:2]]
+    js = json.dumps({"执行清单": [x for x in sel if x["id"]],
+                     "人工事项": [{"对象": "tangliuquan-US/ZJPL066", "动作": "核对我方价格29.71高于竞品最低价27.81", "理由": "(模拟)3b"}]},
+                    ensure_ascii=False, indent=1)
+    return ("## 第二部分 执行建议\n## 八、执行建议清单\n```json\n" + js + "\n```\n"
+            "## 九、暂不动作\n## 十、执行前需要人工核对的事项\n## 十一、数据限制与缺口\n## 十二、相对上周的判断修正\n无\n")
 
 
 def main(cmds):

@@ -12,6 +12,7 @@ plugins/
    ├─ weekly_pipeline_spapi.py  # ingest(合并) / pack(AI数据包) / window
    ├─ recognize.py              # 按表头识别领星导出、统一改名、检查齐全
    ├─ render_pdf.py             # 周报 .md → 带样式 HTML → 本机 Chrome/Edge 打印成 PDF
+   ├─ actions.py                # 候选动作(规则生成) + 校验 AI 选择的执行清单
    ├─ config.json               # 参数；SP-API 凭证指向 ../../ziliao/
    ├─ test/inputs/<周结束日>/    # ★ 测试数据：领星导出 + SP-API .bin(文件名随意)
    ├─ test/ raw/ spapi_cache/ weekly.db out/   # 测试工作区(自动生成)
@@ -36,6 +37,16 @@ tools/local_test.py             # 本地模拟(伪造 config/feishu_gateway/ai_r
 2. 在目标群发 `/经营周报 绑定`，再发 `/经营周报 定时 开启`：每周五 13:00(北京时间)自动跑上一周(周日~周六)，
    从 inbox 导入 → 拉 SP-API → AI 周报 → 发文件 + 概述；文件不全会在群里提示缺什么。
 3. 凭证：`ziliao/亚马逊sp-api.txt`、`ziliao/亚马逊sp-api-xupeng.txt`。依赖：`pandas openpyxl requests python-amazon-sp-api markdown`；PDF 用本机 Chrome(或 Edge)，找不到时设环境变量 `CHROME_PATH`。转 PDF 失败会改发 .md 并在概述里说明。
+
+## 执行清单(为 API 自动执行做准备)
+
+1. 数据包第 5 节“候选动作”由规则生成(`actions.py`)：空运/海运发货件数、催交逾期 PO、新采购、控速降预算、加预算、加/降竞价、试探降价、
+   否定词/否定ASIN、自动词收割。每条带 ID、对象原名(广告活动/广告组/关键词/投放)、当前值、建议值、允许范围、依据；
+   断货/库存紧张/促销占比高的父体，加投类候选标为“不可选”并写明原因。同时保存 `out/candidates_<周>.json`。
+2. AI 第二部分 八 节只输出 JSON，从候选里选 ID(可改优先级一级、在允许范围内改数值)；候选外的动作放“人工事项”。
+3. 插件校验：ID 不存在、被规则阻止、数值超范围、同父体控速又加投、同对象又加又减、同词既否又收 → 拦截。
+   八 节表格由程序按校验结果生成(通过 / 被拦截及原因 / 人工事项)，结果存 `out/actions_<周>.json`，以后 Ads API 按名称查 ID 执行。
+4. 阈值在 `config.json` 的 `action_rules` 里覆盖(默认值见 `actions.py` 的 `DEFAULT_RULES`)。
 
 ## 其它指令
 
