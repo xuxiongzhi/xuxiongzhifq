@@ -116,6 +116,7 @@ DEFAULT_CONFIG = {
     "receiving_avail_days": 10,               # 货到亚马逊仓(送达/开始入库)后到可售的天数；海运 发货→可售 ≈ 备货+历史中位运输(发货→开始入库)+此值 ≈ 40天
     "replen_cycle_days": 10,                  # 发货周期：每隔多少天发一次海运，建议海运发货件数要覆盖到下一批到仓
     "safety_stock_days": 10,                  # 安全库存天数：只用于建议发货/补货件数，不影响断货判定(卖空才算断货)
+    "signed_pending_days": 7,                 # 货件签收明细里最近N天净签收的件数视为"已签收待上架"(亚马逊已签收、还没进可售，Listing可售/在途都不含)，按 签收日+上架天数 计入供给；0=不计
     "local_ship_prep_days": 2,                # 本地仓库存从决定发货到发出的备货天数(装箱/贴标/交货代)，用于断货模拟里的本地仓空运/海运到仓日
     "spapi_skip_countries": [],               # 不请求SP-API的站点，例如授权只覆盖北美时填 ["UK"]，省掉每周的 Unauthorized 警告
     "spapi_allow_duplicate_store_aliases": False,
@@ -779,6 +780,7 @@ FIELD_DOC = pd.DataFrame([
     ("订单均价", "订单销售额÷(订单件数-换货件数)；换货订单销售额为0，不应拉低均价"),
     ("订单促销销售额/订单实收销售额/订单实收均价", "促销(如Vine免费样品)单位在订单里有名义Item Price(与SP销售额口径一致)，但销售收益为0、没有真实收入；实收销售额=订单销售额−促销名义销售额；实收均价=实收销售额÷(件数−换货−促销)"),
     ("货件_已发货在途件数/货件_入库中待收件数", "领星FBA货件：SHIPPED/IN_TRANSIT 的已发货件数 / RECEIVING 的(已发货-签收量，逐SKU取>=0)；已与Listing在途逐父体核对(差异来自发往停售子体的件数)"),
+    ("货件_已签收待上架件数", "亚马逊最近 signed_pending_days(默认7)天已签收、还没进可售的件数(按货件签收明细的净签收；Listing可售/在途里都没有这部分)；断货模拟按 签收日+上架天数 可售计入"),
     ("最早到仓日/最晚到仓日/最晚可售日", "到仓=送达时段起/止(卖家中心登记值，未获货代确认的只是预估)，入库中=开始入库日；可售日=到仓日+receiving_avail_days(默认10天，亚马逊收货上架)，断货模拟按可售日入库"),
     ("到仓_保守_7日内/8-14日/15-30日/30日后", "按'送达时段止'(保守)分桶的到仓件数"),
     ("断货天数_乐观/保守", "用日均7逐日模拟未来shipment_horizon_days(默认60)天：乐观=送达时段起+上架天数可售，保守=送达时段止+上架天数可售；库存不够卖满一天日均的天数。不含采购在途/本地仓库存"),
@@ -798,6 +800,7 @@ FIELD_DOC = pd.DataFrame([
     ("建议海运发货件数", "今天从本地仓海运发出、在(备货+海运中位+上架)天后可售的一批货，最少多少件能让它可售起到'海运发货_覆盖至第N天'(=到可售天数+发货周期replen_cycle_days+安全库存safety_stock_days)都不断货；可售日之前的断货海运补不上，不计(看断货天数/空运)；已计入FBA可售、在途、工厂待交付；0=不用发；空=无销量。父体级合计，需按尺码拆分"),
     ("海运发货_本地仓不足件数", "建议海运发货件数 − (本地可用 − 建议空运件数)；本地仓先保空运，>0 表示本地仓不够发，差额要新采购或控速"),
     ("建议空运件数", "今天从本地仓空运发出、在 空运可售_天后(备货+空运中位+上架)可售的一批货，最少多少件能撑到 海运可售_天后(之后由今天发的海运接上)；0=海运前不会断货，不用空运；空=无销量。空运可售之前的断货补不上，见 空运可售前无法避免断货天数(只能控速)。父体级合计，需按尺码拆分"),
+    ("建议空运件数_按14日均", "同 建议空运件数，但日均改用 销量14÷14(领星Listing滚动14日)；只在14日均低于日均7时计算。两者差距大=空运量对销量假设很敏感，近期是否放量要人工判断"),
     ("空运可售前无法避免断货天数", "只算FBA+在途+待交付时，在空运可售日之前就断货的天数：任何发货都来不及，只能降竞价/降预算/提价控速"),
     ("空运发货_本地仓不足件数", "建议空运件数 − 本地可用；>0 表示本地仓不够空运"),
     ("未来60日缺口件数", "日均7×60 − FBA可售 − 表内在途(不含采购在途/本地仓库存)；>0 表示60天内需要再补这么多"),
@@ -1629,7 +1632,7 @@ def read_shipments(path, cfg, q, week_end):
     if miss:
         q.add("WARN", "FBA货件", f"缺少必要列 {miss}，本次不使用货件文件")
         return None
-    d = d[SHIP_COLS].copy()
+    d = d[SHIP_COLS + (["签收明细"] if "签收明细" in d.columns else [])].copy()
     hdr = [c for c in SHIP_COLS if c not in ("MSKU", "父ASIN", "已发货", "签收量", "申报量")]
     d[hdr] = d[hdr].ffill()
     for c in ("已发货", "签收量", "申报量"):
@@ -1653,6 +1656,26 @@ def read_shipments(path, cfg, q, week_end):
     wk = st == "WORKING"
     d["计划"] = np.where(wk, d["申报量"], 0.0)
     d["状态"] = st
+    # ---- 已签收待上架：亚马逊已签收(签收量已扣出'在途')但还没进可售——Listing/库存报告里既不在可售也不在在途，会"消失"几天。
+    # 按签收明细取最近 signed_pending_days 天的净签收件数(含更正的负数)，视为 签收日+上架天数 可售
+    pend_days = int(cfg.get("signed_pending_days", 7))
+    d["待上架"], d["签收日"] = 0.0, None
+    if pend_days > 0 and "签收明细" in d.columns:
+        lo = snap - timedelta(days=pend_days)
+        pq, pdt = [], []
+        for txt, stt, sq in zip(d["签收明细"], st, d["签收量"]):
+            ent = [(datetime.strptime(a_, "%Y-%m-%d").date(), float(b_)) for a_, b_ in re.findall(r"(\d{4}-\d{2}-\d{2})\s*\|\s*(-?\d+(?:\.\d+)?)", str(txt))] \
+                if stt in ("RECEIVING", "CLOSED") else []
+            rec = [(a_, b_) for a_, b_ in ent if lo < a_ <= snap]
+            net = min(max(sum(b_ for _, b_ in rec), 0.0), max(sq, 0.0))
+            pq.append(net)
+            pdt.append(max((a_ for a_, b_ in rec if b_ > 0), default=None) if net > 0 else None)
+        d["待上架"], d["签收日"] = pq, pdt
+        if d["待上架"].sum() > 0:
+            g_ = d[d["待上架"] > 0].groupby(["店铺", "货件单号"]).agg(件=("待上架", "sum"), 日=("签收日", "max")).reset_index()
+            q.add("INFO", "FBA已签收待上架", f"最近{pend_days}天亚马逊已签收、但通常还没进可售的共 {int(g_['件'].sum())} 件：" +
+                  "；".join(f"{a_}/{b_} {int(c_)}件(签收{e_})" for a_, b_, c_, e_ in zip(g_["店铺"].head(6), g_["货件单号"].head(6), g_["件"].head(6), g_["日"].head(6))) +
+                  f"。这部分不在Listing可售/在途里，断货模拟按 签收日+上架天数 计入供给(列 货件_已签收待上架件数)；若其中一部分已进可售，会重复计算，偏乐观")
     n_sh = d.loc[d["状态"] != "CANCELLED", "货件单号"].nunique()
     # ---- 诊断：超期未到 / 入库滞留 / 少收 / 历史运输时长
     late = d[live_ship & d["窗口止"].notna() & (d["窗口止"] < snap) & (d["待收"] > 0)]
@@ -1950,14 +1973,19 @@ def supply_summary(P, replen, ship, cfg, q):
         cq = _cover_qty(S0, dmd, s1, w_sea, snap, cover_end)
         # 空运：今天空运发出，覆盖 空运可售日 ~ 海运可售日(之后由今天发的海运接上)；空运可售之前的断货任何发货都补不上
         d_air = (w_air - snap).days
+        d14 = (r.get("销量14") or 0) / 14 if pd.notna(r.get("销量14")) else None
+        if w_air < w_sea and d14 is not None and dmd and d14 < dmd:      # 敏感性：按14日均(通常更低)时的空运量
+            cqa_lo = _cover_qty(S0, d14, s1, w_air, snap, (w_sea - snap).days)
+        else:
+            cqa_lo = np.nan
         if w_air < w_sea:
             cqa = _cover_qty(S0, dmd, s1, w_air, snap, (w_sea - snap).days)
             pre, _ = _sim_stockout(S0, dmd, s1, snap, d_air - 1) if d_air > 1 else (0 if dmd and dmd > 0 else np.nan, None)
         else:
             cqa, pre = np.nan, np.nan
-        res.append((out1, f1, oa, fa, os_, fs, ma, ms, cq, cqa, pre))
+        res.append((out1, f1, oa, fa, os_, fs, ma, ms, cq, cqa, pre, cqa_lo))
     for i_, c in enumerate(["断货天数_含待交付", "首次断货_含待交付_天后", "断货天数_全供给_空运", "首次断货_全供给_空运_天后", "断货天数_全供给_海运", "首次断货_全供给_海运_天后",
-                            "本地仓最少空运件数_避免断货", "本地仓最少海运件数_避免断货", "建议海运发货件数", "建议空运件数", "空运可售前无法避免断货天数"]):
+                            "本地仓最少空运件数_避免断货", "本地仓最少海运件数_避免断货", "建议海运发货件数", "建议空运件数", "空运可售前无法避免断货天数", "建议空运件数_按14日均"]):
         P[c] = [x[i_] for x in res]
     _loc = P["本地可用"].fillna(0)
     P["空运发货_本地仓不足件数"] = (P["建议空运件数"] - _loc).clip(lower=0).where(P["建议空运件数"].notna())
@@ -1974,11 +2002,15 @@ def ship_summary(P, ship, cfg, q, L):
     """按 (店铺,父ASIN) 汇总在途货件：到仓分桶 + 用日均销量模拟未来N天是否断货。返回 (P, 明细DataFrame)"""
     d = ship["rows"]; snap = ship["snap"]; H = int(cfg.get("shipment_horizon_days", 60)); rv = int(cfg.get("receiving_avail_days", 10))
     live = d[(d["待收"] > 0) | (d["计划"] > 0)].copy()
+    pend = d[d["待上架"] > 0].copy() if "待上架" in d.columns else d.iloc[0:0].copy()
+    if len(pend):          # 已签收待上架：单独成行，到仓日=签收日，件数=待上架
+        pend["待收"], pend["计划"], pend["状态"], pend["入库开始日"] = pend["待上架"], 0.0, "已签收待上架", pend["签收日"]
+        live = pd.concat([live, pend], ignore_index=True)
     m2p = dict(zip(zip(L["店铺"], L["MSKU"]), L["父ASIN"]))
     live["父ASIN"] = live["父ASIN"].where(live["父ASIN"].notna(), pd.Series([m2p.get((s_, k_)) for s_, k_ in zip(live["店铺"], live["MSKU"])], index=live.index))
     live = live.dropna(subset=["父ASIN"])
     qty = live["待收"] + live["计划"]
-    is_rcv = live["状态"] == "RECEIVING"
+    is_rcv = live["状态"].isin(["RECEIVING", "已签收待上架"])
     # 到仓日：入库中=开始入库日(缺失用快照日)；已发货=送达时段(起/止)；无窗口=缺失
     # 可售日=到仓日+receiving_avail_days(亚马逊收货上架)，断货模拟一律按可售日入库
     _rs = [x if (x is not None and not pd.isna(x)) else snap for x in live["入库开始日"]]
@@ -1992,12 +2024,13 @@ def ship_summary(P, ship, cfg, q, L):
     sell_par = set(zip(P.loc[P["在售子体数"] > 0, "店铺"], P.loc[P["在售子体数"] > 0, "父ASIN"]))
     live["计入供给"] = [(st_map.get((s_, m_), "在售") == "在售") or ((s_, p_) not in sell_par)
                      for s_, m_, p_ in zip(live["店铺"], live["MSKU"], live["父ASIN"])]
-    all_tot = live.groupby(["店铺", "父ASIN"])["件数"].sum()          # 全部在途(含发往停售子体)，只用于与Listing对账
+    all_tot = live[live["状态"] != "已签收待上架"].groupby(["店铺", "父ASIN"])["件数"].sum()   # 全部在途(含发往停售子体)，只用于与Listing对账
     detail = live[["店铺", "父ASIN", "货件单号", "状态", "运输方式", "物流中心编码", "发货日", "窗口起", "窗口止", "计入供给", "已发货", "签收量", "件数"]].copy()
     rows = {}
     for (store, par), g in live[live["计入供给"]].groupby(["店铺", "父ASIN"]):
-        r = {"在途货件数": g["货件单号"].nunique(), "货件_已发货在途件数": float(g.loc[g["状态"].isin(["SHIPPED", "IN_TRANSIT"]), "件数"].sum()),
+        r = {"在途货件数": g.loc[g["状态"] != "已签收待上架", "货件单号"].nunique(), "货件_已发货在途件数": float(g.loc[g["状态"].isin(["SHIPPED", "IN_TRANSIT"]), "件数"].sum()),
              "货件_入库中待收件数": float(g.loc[g["状态"] == "RECEIVING", "件数"].sum()), "货件_计划入库件数": float(g.loc[g["状态"] == "WORKING", "件数"].sum()),
+             "货件_已签收待上架件数": float(g.loc[g["状态"] == "已签收待上架", "件数"].sum()),
              "货件_无送达时段件数": float(g.loc[g["到仓_保守"].isna(), "件数"].sum())}
         dd = g.dropna(subset=["到仓_保守"])
         r["最早到仓日"] = min(g["到仓_乐观"].dropna()) if g["到仓_乐观"].notna().any() else None
@@ -2012,7 +2045,9 @@ def ship_summary(P, ship, cfg, q, L):
     P = P.merge(S, on=["店铺", "父ASIN"], how="left")
     # 有货件文件覆盖的店铺：没有在途货件=0
     cov = P["店铺"].isin(set(d["店铺"].unique()))
-    for c in ["在途货件数", "货件_已发货在途件数", "货件_入库中待收件数", "货件_计划入库件数", "货件_无送达时段件数"] + [c for c in P.columns if c.startswith("到仓_保守_")]:
+    for c in ["在途货件数", "货件_已发货在途件数", "货件_入库中待收件数", "货件_计划入库件数", "货件_已签收待上架件数", "货件_无送达时段件数"] + [c for c in P.columns if c.startswith("到仓_保守_")]:
+        if c not in P.columns:
+            P[c] = np.nan
         P.loc[cov, c] = P.loc[cov, c].fillna(0)
     for c in ("最早到仓日", "最晚到仓日", "最晚可售日"):          # 与其它日期列一致，存为 YYYY-MM-DD 文本
         P[c] = P[c].astype(str).replace({"NaT": "", "None": "", "nan": ""})
@@ -2868,7 +2903,7 @@ def cmd_pack(a, cfg):
     if "订单件数" in oc and ol["订单件数"].notna().any():
         ol = ol[ol["订单件数"].notna()].sort_values("订单件数", ascending=False)
         md.append("## 3d. 订单口径(最新一周；销量来源=订单导出 时即 销量7/销售额7 的来源)\n" + md_table(ol, ["店铺", "款"] + oc))
-    sc_ = [c for c in ["库存天数_7", "含在途天数_7", "日均7", "FBA可售", "货件_已发货在途件数", "货件_入库中待收件数", "最早到仓日", "最晚到仓日",
+    sc_ = [c for c in ["库存天数_7", "含在途天数_7", "日均7", "FBA可售", "货件_已发货在途件数", "货件_入库中待收件数", "货件_已签收待上架件数", "最早到仓日", "最晚到仓日",
                        "到仓_保守_7日内", "到仓_保守_8-14日", "到仓_保守_15-30日", "到仓_保守_30日后", "断货天数_乐观", "断货天数_保守", "首次断货_天后",
                        "海运最晚发货_天后", "空运最晚发货_天后", "海运最晚下单_天后", "空运最晚下单_天后", "采购交期_天", "未来60日缺口件数", "在途_发往非在售子体件数"] if c in P.columns]
     _lt0 = P[P["周结束"] == latest]
@@ -2877,9 +2912,9 @@ def cmd_pack(a, cfg):
     sim_note = (f"模拟起算日={_sim0.iloc[0]}(FBA货件/补货快照日，不是周结束日{latest})，首次断货_天后/最晚发货_天后/最晚下单_天后都从这天算。" if len(_sim0) else "")
     has_sup = "断货天数_全供给_海运" in P.columns and P[P["周结束"] == latest]["断货天数_全供给_海运"].notna().any()
     if has_sup:
-        cc_ = [c for c in ["库存天数_7", "日均7", "FBA可售", "货件_已发货在途件数", "货件_入库中待收件数", "最晚到仓日", "最晚可售日", "本地可用", "待交付", "待交付_最早预计可售日", "待交付_最晚预计可售日",
+        cc_ = [c for c in ["库存天数_7", "日均7", "FBA可售", "货件_已发货在途件数", "货件_入库中待收件数", "货件_已签收待上架件数", "最晚到仓日", "最晚可售日", "本地可用", "待交付", "待交付_最早预计可售日", "待交付_最晚预计可售日",
                            "待交付_已过预计到货件数", "待交付_无PO明细件数", "断货天数_保守", "首次断货_天后", "断货天数_含待交付", "断货天数_全供给_空运", "断货天数_全供给_海运",
-                           "首次断货_全供给_海运_天后", "本地仓最少空运件数_避免断货", "本地仓最少海运件数_避免断货", "空运可售前无法避免断货天数", "建议空运件数", "空运发货_本地仓不足件数",
+                           "首次断货_全供给_海运_天后", "本地仓最少空运件数_避免断货", "本地仓最少海运件数_避免断货", "空运可售前无法避免断货天数", "建议空运件数", "建议空运件数_按14日均", "空运发货_本地仓不足件数",
                            "建议海运发货件数", "海运发货_本地仓不足件数", "空运可售_天后", "海运可售_天后", "海运发货_覆盖至第N天",
                            "新采购最晚下单_海运_天后", "新采购最晚下单_空运_天后",
                            "未来60日缺口件数_含全部供给", "在途_发往非在售子体件数"] if c in P.columns]
@@ -2887,7 +2922,7 @@ def cmd_pack(a, cfg):
         sl2 = sl2[(sl2["日均7"].fillna(0) > 0) | ((sl2["货件_已发货在途件数"].fillna(0) + sl2["货件_入库中待收件数"].fillna(0) + sl2["待交付"].fillna(0) + sl2["本地可用"].fillna(0)) > 0)]
         sl2 = sl2.sort_values(["断货天数_全供给_海运", "断货天数_保守"], ascending=[False, False], na_position="last")
         md.append("## 3e. 供给链条与断货风险(最新一周；按'全供给海运'断货天数降序)\n"
-                  "说明：" + sim_note + "按日均7匀速销售逐日模拟未来60天。供给分层：S0=FBA可售+已发货/入库中货件(可售=送达时段止/开始入库日+上架天数，送达时段是登记值，海运常延误)→断货天数_保守；"
+                  "说明：" + sim_note + "按日均7匀速销售逐日模拟未来60天。供给分层：S0=FBA可售+已发货/入库中货件+已签收待上架(可售=送达时段止/开始入库日/签收日+上架天数，送达时段是登记值，海运常延误)→断货天数_保守；"
                   f"S1=S0+工厂待交付(按领星预计可售日，已过预计到货日的按晚到天数顺延)→断货天数_含待交付；S2=S1+本地仓库存今天发出(空运/海运，可售=备货{int(cfg.get('local_ship_prep_days', 2))}天+历史中位运输天数+上架{int(cfg.get('receiving_avail_days', 10))}天)→断货天数_全供给_空运/海运。"
                   "本地仓最少空运/海运件数=刚好避免60天内断货所需的发出量(0=不发也不断货；空=全部发出也避免不了——件数不够或断货早于这批货可售日——或没有本地库存/没有销量)；新采购最晚下单=S2首次断货−采购交期−备货−运输−上架，<0=新下单也来不及，空=60天内不需要新采购(全部供给数量够、断货只因到货时间时也为空)。"
                   f"建议海运发货件数=今天海运发出的量，覆盖从海运可售日到 到可售天数+发货周期{int(cfg.get('replen_cycle_days', 10))}天+安全库存{int(cfg.get('safety_stock_days', 10))}天(见 海运发货_覆盖至第N天)；可售日之前的断货海运补不上，要看空运/控速；建议空运件数=今天空运发出、撑到海运可售日所需的最少件数(0=不用空运)；空运可售前无法避免断货天数>0=空运也来不及，只能控速；海运发货_本地仓不足件数 已先扣掉建议空运件数。"

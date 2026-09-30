@@ -152,10 +152,16 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
         small_air = air if (air and 0 < air < R["air_min_units"]) else 0
         if air and air >= R["air_min_units"]:
             short = _f(r.get("空运发货_本地仓不足件数")) or 0
-            add("INV_AIR_SHIP", key, 对象="本地仓→FBA 空运", 单位="件", 当前值=0, 建议值=air, 允许范围=[air, math.ceil(air * 1.2)],
+            lo14 = _f(r.get("建议空运件数_按14日均"))
+            lo = max(R["air_min_units"], lo14) if lo14 is not None else air      # 下限放到按14日均算的量：销量回落时不必空运这么多
+            s14 = ""
+            if lo14 is not None:
+                d14 = (_f(r.get("销量14")) or 0) / 14
+                s14 = f"；按14日均{d14:.1f}只需{lo14:.0f}件(空运量对销量假设敏感，近期是否持续放量需人工判断)"
+            add("INV_AIR_SHIP", key, 对象="本地仓→FBA 空运", 单位="件", 当前值=0, 建议值=air, 允许范围=[min(lo, air), math.ceil(air * 1.2)],
                 规则优先级="P0", _rank=1e6 + air,
                 依据=f"{base}；空运第{_f(r.get('空运可售_天后')) or 0:.0f}天可售，撑到海运可售第{_f(r.get('海运可售_天后')) or 0:.0f}天最少{air:.0f}件"
-                     + (f"；空运前仍断货{pre:.0f}天(需同时控速)" if pre else "") + (f"；本地仓不足{short:.0f}件" if short else "") + "；父体合计，需按尺码拆分")
+                     + s14 + (f"；空运前仍断货{pre:.0f}天(需同时控速)" if pre else "") + (f"；本地仓不足{short:.0f}件" if short else "") + "；父体合计，需按尺码拆分")
         if sea and sea > 0:
             short = _f(r.get("海运发货_本地仓不足件数")) or 0
             add("INV_SEA_SHIP", key, 对象="本地仓→FBA 海运", 单位="件", 当前值=0, 建议值=sea, 允许范围=[sea, math.ceil(sea * 1.2)],
