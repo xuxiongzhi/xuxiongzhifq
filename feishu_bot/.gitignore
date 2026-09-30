@@ -1,5 +1,8 @@
-# 运行时数据与结果(含店铺经营数据)，不入库
+# 运行时数据、测试数据与结果(含店铺经营数据)，不入库
 plugins/weekly_report/data/
 plugins/weekly_report/out/
+plugins/weekly_report/test/
+plugins/weekly_report/logs/
+plugins/weekly_report/周报_state.json
 __pycache__/
 *.pyc

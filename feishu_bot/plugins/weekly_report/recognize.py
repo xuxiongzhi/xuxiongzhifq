@@ -5,7 +5,7 @@
 # 用法(命令行，插件也是这样调用)：
 #   python recognize.py import --src data/inbox --week-end 2026-09-26          # 从收件箱识别、改名、移入 raw/<周>/
 #   python recognize.py check  --week-end 2026-09-26                           # 只检查 raw/<周>/ 是否齐全
-#   加 --json 输出机器可读结果(插件解析用)
+#   加 --json 输出机器可读结果(插件解析用)；--root 指定工作区(默认 data/，测试工作区为 test/)
 #
 # 输出：data/raw/<周>/manifest.json
 #   {"week_end", "window", "files": {类型: {...}}, "missing_required", "missing_optional", "unknown", "checks", "ok"}
@@ -15,8 +15,14 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings("ignore")
 HERE = os.path.dirname(os.path.abspath(__file__))
-RAW_ROOT = os.path.join(HERE, "data", "raw")
+RAW_ROOT = os.path.join(HERE, "data", "raw")              # 工作区可用 set_root() 切换(测试工作区 test/)
 SPAPI_CACHE = os.path.join(HERE, "data", "spapi_cache")
+
+
+def set_root(root):
+    global RAW_ROOT, SPAPI_CACHE
+    RAW_ROOT = os.path.join(root, "raw")
+    SPAPI_CACHE = os.path.join(root, "spapi_cache")
 
 # 类型 -> (中文名, 标准文件名模板, 是否必需)
 # 标准文件名要包含周脚本 find_file 用的关键字；快照类文件名带 _YYYYMMDD_ (脚本从这里取快照日)
@@ -200,7 +206,10 @@ def main():
     c = sub.add_parser("check"); c.add_argument("--week-end", required=True)
     for p_ in (i, c):
         p_.add_argument("--json", action="store_true")
+        p_.add_argument("--root", default="", help="工作区根目录(含 raw/ 与 spapi_cache/)")
     a = ap.parse_args()
+    if a.root:
+        set_root(os.path.abspath(a.root))
     if a.cmd == "import":
         man = do_import(a.src, a.week_end, move=not a.copy)
     else:
