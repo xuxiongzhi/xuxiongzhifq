@@ -388,6 +388,32 @@ def read_cost(path, cfg, q):
         q.add("WARN", "头程读取失败", f"读取'按国家维护头程清关'工作表失败：{e}")
     return out
 
+_G_F = re.compile(r"\bwom[ae]n'?s?\b|\bladies\b|\blady\b|\bfemale\b|\bgirls?\b|feminin|femenin|mujer|mulher|damen|femme", re.I)
+_G_M = re.compile(r"\bm[ae]n'?s?\b|\bmale\b|\bboys?\b|\bgentlem[ae]n\b|masculin|hombre|homem|herren|homme", re.I)
+_CATS = [(r"dress|vestido|robe dress", "连衣裙"), (r"\bpolo\b", "Polo衫"), (r"t-?shirt|\btee\b|camiseta", "T恤"),
+         (r"blouse|blusa", "女式衬衫"), (r"shirt|camisa", "衬衫"), (r"\brobe\b|túnica|tunica", "长袍")]
+_SLEEVE = [(r"sleeveless|sin mangas|sem mangas", "无袖"), (r"3/4|three.quarter|manga 3/4", "七分袖"), (r"half sleeve|meia manga|media manga", "中袖"),
+           (r"short sleeve|manga curta|manga corta", "短袖"), (r"long sleeve|manga longa|manga larga", "长袖")]
+
+
+def text_gender(t):
+    """文本(标题/搜索词)里的性别：女/男/男女/''(未提及)"""
+    t = str(t or "")
+    f, m = bool(_G_F.search(t)), bool(_G_M.search(t))
+    return "男女" if f and m else ("女" if f else ("男" if m else ""))
+
+
+def product_profile(titles):
+    """父体下各子体标题 → (性别, 品类, 袖长)。性别取子体多数；标题没写性别=未知(不猜)"""
+    gs = [text_gender(t) for t in titles if isinstance(t, str) and t.strip()]
+    gs = [g for g in gs if g]
+    gender = max(set(gs), key=gs.count) if gs else "未知"
+    joined = " ".join(str(t) for t in titles if isinstance(t, str)).lower()
+    cat = next((c for pat, c in _CATS if re.search(pat, joined, re.I)), "未知")
+    sleeves = sorted({sl for pat, sl in _SLEEVE if re.search(pat, joined, re.I)})
+    return gender, cat, "/".join(sleeves) or "未写"
+
+
 def dominant(prod_m, keys):
     """广告活动/广告组 -> 花费最多的父体；同时返回对应多个父体的组"""
     t = prod_m.copy()
@@ -433,6 +459,21 @@ def build_parent(L, prod_m, cost, spapi, week_end, cfg, q, orders=None, ship=Non
                   f"{k}：{int(r_['父体数'])}个父体，在途{int(r_['在途件数'])}件，FBA可售{int(r_['可售件数'])}件" for k, r_ in by.iterrows())
               + "。货到仓前要确认Listing已激活")
     P["币种"] = "USD"   # 所有金额已折算为USD
+    # ---- 商品属性(来自 Listing 标题；config.product_gender_override 可按款强制指定性别)
+    if "标题" in L.columns:
+        _src = L.sort_values("状态", key=lambda s_: (s_ != "在售").astype(int))
+        _tt = _src.groupby(["店铺", "父ASIN"])["标题"].apply(list).to_dict()
+        prof = [product_profile(_tt.get((a_, b_), [])) for a_, b_ in zip(P["店铺"], P["父ASIN"])]
+        P["商品性别"] = [x[0] for x in prof]; P["品类"] = [x[1] for x in prof]; P["袖长"] = [x[2] for x in prof]
+        P["标题摘要"] = [str((_tt.get((a_, b_)) or [""])[0])[:90] for a_, b_ in zip(P["店铺"], P["父ASIN"])]
+    else:
+        P["商品性别"], P["品类"], P["袖长"], P["标题摘要"] = "未知", "未知", "未写", ""
+    ov = {str(k).upper(): v for k, v in (cfg.get("product_gender_override") or {}).items()}
+    if ov:
+        P["商品性别"] = [ov.get(str(k_).upper(), g_) for k_, g_ in zip(P["款"], P["商品性别"])]
+    unk = P.loc[P["商品性别"] == "未知", "款"].unique().tolist()
+    q.add("WARN" if unk else "OK", "商品性别识别", (f"{len(unk)} 个款标题里没写性别，报告不得推断：{unk[:10]}；可在 config.product_gender_override 指定" if unk
+                                                  else f"全部父体已从标题识别性别：" + "、".join(f"{k_}={g_}" for k_, g_ in P.drop_duplicates("款")[["款", "商品性别"]].values)))
     P["评论数"] = P["评论数"].fillna(0)
     P["上架天数"] = (pd.Timestamp(week_end) - P["首次开售"]).dt.days
     P = P.drop(columns=["首次开售"])
@@ -2369,6 +2410,8 @@ PROMPT = """# 角色与任务
 - 数据包没有的数据一律写"无数据"，并在"数据限制与缺口"里说明缺哪份报表、影响哪个结论。禁止估算、禁止用行业经验值、禁止编造对比期。
   常见的"没有"：利润报表/结算数据、子体(尺码/颜色/MSKU)级销量与退货、30天环比、搜索排名、竞品销量、今日数据、广告后台以外的归集口径。
 - 数据粒度是 店铺×父体；不得对具体尺码/颜色/MSKU 下结论(除非数据包里出现了该子体的数据)。
+- 商品属性(男装/女装、品类、袖长)只以"1c 产品档案"为准；严禁根据搜索词、关键词或广告活动名推断商品性别。
+  搜索词/关键词表的"性别匹配"列：不符=词的性别与商品相反(如女装连衣裙被 "for men" 触发)，是优先的否定候选、也不能当收割词；中性=词里没写性别。
 - 库里只有一周时(见 1b 的说明)，不得写环比、趋势、"改善/恶化"；只能描述本周现状。
 - 头程：'头程估算方式'非空的父体，头程是估算值(同款同尺码其它颜色，或 单品毛重×同系列每公斤头程——同系列实测每公斤头程基本一致)，可以用来算单件毛利/盈亏ACoS/利润，但引用时要注明"头程为估算"。
 
@@ -2508,6 +2551,16 @@ def summary_md(S, prev=None):
     return "\n".join(out) + "\n"
 
 
+def _gmatch(term, product_gender):
+    """搜索词/关键词的性别 vs 商品性别：一致/不符/中性(词里没写性别)/商品性别未知"""
+    tg = text_gender(term)
+    if not tg:
+        return "中性"
+    if product_gender not in ("男", "女"):
+        return "商品性别未知"
+    return "一致" if tg in (product_gender, "男女") else "不符"
+
+
 def read_weeks(con, table, weeks):
     ex = con.execute("select name from sqlite_master where type='table' and name=?", (table,)).fetchone()
     if not ex:
@@ -2604,7 +2657,10 @@ def cmd_pack(a, cfg):
     targets = [k for k, v in spend_win.items() if v and v > 0][: top["detail_parents"]]
     for k in targets:
         sel = lambda df: df[(df["店铺"] == k[0]) & (df["款"] == k[1])] if len(df) else df
-        blk = [f"### {k[0]} | {k[1]} | 父ASIN {k[2]}\n"]
+        _pr = P[(P["周结束"] == latest) & (P["店铺"] == k[0]) & (P["父ASIN"] == k[2])]
+        pg_ = str(_pr["商品性别"].iloc[0]) if len(_pr) and "商品性别" in _pr.columns else "未知"
+        _cat = str(_pr["品类"].iloc[0]) if len(_pr) and "品类" in _pr.columns else "未知"
+        blk = [f"### {k[0]} | {k[1]} | 父ASIN {k[2]} | 商品：{pg_}装 {_cat}\n"]
         if len(C):
             cl = sel(C[C["周结束"] == latest]).copy()
             cw = sel(C).groupby("广告活动").agg(窗口花费=("花费", "sum"), 窗口销售=("广告销售", "sum"), 窗口订单=("广告订单", "sum")).reset_index()
@@ -2624,7 +2680,8 @@ def cmd_pack(a, cfg):
             kl["ACoS"] = kl["花费"] / kl["广告销售"].where(kl["广告销售"] > 0)
             kl["CVR"] = kl["广告订单"] / kl["点击"].where(kl["点击"] > 0)
             kl = kl[kl["花费"] > 0].sort_values("花费", ascending=False).head(top["keywords"])
-            blk.append("**手动关键词(窗口累计，按花费Top)**\n" + md_table(kl, ["关键词", "匹配方式", "当前竞价", "点击", "花费", "广告订单", "ACoS", "CVR"]))
+            kl["性别匹配"] = [_gmatch(t_, pg_) for t_ in kl["关键词"]]
+            blk.append("**手动关键词(窗口累计，按花费Top)**\n" + md_table(kl, ["关键词", "匹配方式", "性别匹配", "当前竞价", "点击", "花费", "广告订单", "ACoS", "CVR"]))
         if len(AU):
             al = sel(AU[AU["周结束"] == latest])
             al = al[al["花费"] > 0].sort_values("花费", ascending=False)
@@ -2633,10 +2690,11 @@ def cmd_pack(a, cfg):
             sg = sel(S).groupby(["用户搜索词", "来源", "词类型", "已投放为手动词"]).agg(
                 周数=("周结束", "nunique"), 点击=("点击", "sum"), 花费=("花费", "sum"), 广告销售=("广告销售", "sum"), 广告订单=("广告订单", "sum")).reset_index()
             sg["ACoS"] = sg["花费"] / sg["广告销售"].where(sg["广告销售"] > 0)
+            sg["性别匹配"] = [_gmatch(t_, pg_) for t_ in sg["用户搜索词"]]
             waste = sg[(sg["广告订单"] == 0) & (sg["点击"] >= cfg["min_clicks_waste"])].sort_values("花费", ascending=False).head(top["waste"])
             win = sg[sg["广告订单"] >= 2].sort_values("广告销售", ascending=False).head(top["winners"])
-            blk.append(f"**搜索词：窗口内零订单且点击>={cfg['min_clicks_waste']}(否定候选)**\n" + md_table(waste, ["用户搜索词", "来源", "词类型", "周数", "点击", "花费"]))
-            blk.append("**搜索词：窗口内订单>=2(收割/加价候选；'已投放为手动词'=否 表示尚未单独投放)**\n" + md_table(win, ["用户搜索词", "来源", "词类型", "已投放为手动词", "周数", "点击", "花费", "广告订单", "ACoS"]))
+            blk.append(f"**搜索词：窗口内零订单且点击>={cfg['min_clicks_waste']}(否定候选)**\n" + md_table(waste, ["用户搜索词", "来源", "词类型", "性别匹配", "周数", "点击", "花费"]))
+            blk.append("**搜索词：窗口内订单>=2(收割/加价候选；'已投放为手动词'=否 表示尚未单独投放)**\n" + md_table(win, ["用户搜索词", "来源", "词类型", "性别匹配", "已投放为手动词", "周数", "点击", "花费", "广告订单", "ACoS"]))
         if len(SQ):
             sqk = SQ[(SQ["店铺"] == k[0]) & (SQ["父ASIN"] == k[2])]
             if len(sqk):
@@ -2671,6 +2729,10 @@ def cmd_pack(a, cfg):
     md.append(f"## 1b. 店铺与全店汇总(最新一周 {latest}；金额USD；空白=该项无数据，不是0)\n"
               + ("" if _Sp is not None else "说明：库里只有这一周，**没有上周可比**，报告里不得写环比。\n")
               + summary_md(_S, _Sp))
+    _lt_ = P[P["周结束"] == latest]
+    if "商品性别" in _lt_.columns:
+        md.append("## 1c. 产品档案(商品属性只以此表为准；来自Listing标题，'未知'=标题没写，不得推断)\n"
+                  + md_table(_lt_.sort_values(["店铺", "款"]), ["店铺", "款", "父ASIN", "商品性别", "品类", "袖长", "在售子体数", "标题摘要"]))
     # ---- 窗口汇总：N周合计，比率按合计重算(周报=1周；月报=4周)
     _s1 = lambda v_: v_.sum(min_count=1)      # 全为空(如 广告已覆盖=否)时保持空，不变成0
     aggm = {"周数": ("周结束", "nunique"), "销量合计": ("销量7", _s1), "销售额合计": ("销售额7", _s1), "广告花费合计": ("广告花费", _s1),
