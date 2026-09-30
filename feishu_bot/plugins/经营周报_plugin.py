@@ -583,6 +583,12 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: 
                     f"{r['款']}(第{int(r['首次断货_含待交付_天后'])}天起{int(r['断货天数_含待交付'])}天"
                     + (f"，空运也补不上{int(r['空运可售前无法避免断货天数'])}天" if r.get("空运可售前无法避免断货天数", 0) > 0 else "") + ")"
                     for _, r in risk.head(5).iterrows()))
+            if "尺码_缺货件数_含待交付" in P.columns:   # 亚马逊按子体判断缺货：尺码级才是真实缺货
+                sz = P[P["尺码_缺货件数_含待交付"].fillna(0) >= 10].sort_values("尺码_缺货件数_含待交付", ascending=False)
+                if len(sz):
+                    lines.append("· 尺码缺货(60天内，含待交付仍缺)：" + "、".join(
+                        f"{r['款']} 缺{r['尺码_缺货件数_含待交付']:.0f}件" + (f"(本地仓对应尺码不足{r['尺码_本地仓不足件数']:.0f})" if r.get("尺码_本地仓不足件数", 0) >= 5 else "")
+                        for _, r in sz.head(5).iterrows()))
             only = P[(P["断货天数_保守"].fillna(0) > 0) & (P["断货天数_含待交付"].fillna(0) == 0)]
             if len(only):
                 lines.append("· 待交付按时到才不断货：" + "、".join(only["款"].astype(str).head(5)) + "(要盯PO交期)")

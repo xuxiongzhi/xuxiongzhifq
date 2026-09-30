@@ -31,9 +31,11 @@ DEFAULT_RULES = {
     "neg_gender_min_clicks": 3,      # 性别不符的搜索词：点击>=3 且 0 单才列否定候选
     "harvest_min_orders": 2,
     "harvest_min_clicks": 5,         # 只有1~2次点击的"出单词"多是7天归因带来的，不收割
-    "air_min_units": 10,             # 建议空运件数少于这个数不单独空运(并入海运)
+    "air_min_units": 10,             # 建议空运件数少于这个数不单独空运(并入海运)；>=3倍时规则优先级P0，否则P1
+    "sea_min_units": 5,              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
     "block_stock_days": 21,          # 含在途天数<21 不加投(提示词硬性规则3)
     "block_promo_share": 0.3,        # 订单促销占比>30% 不加投(提示词硬性规则10)
+    "size_block_share": 0.2,         # 尺码级缺货件数占60天需求>=20% 不加投(主力尺码断货，加投的流量转化不了)
     "max_per_type": 15,              # 每类候选最多列多少条(按花费/影响排序)
     "max_blocked_per_type": 5,       # 被阻止的候选每类最多列几条(只为让 AI 知道为什么不动)
     "max_selected": 12,
@@ -44,6 +46,7 @@ TYPE_INFO = {   # 类型: (ID前缀, 中文名, 执行方式)
     "INV_SEA_SHIP": ("KS", "本地仓海运发FBA", "人工"),
     "PO_FOLLOWUP": ("PF", "催交已逾期采购单", "人工"),
     "PO_NEW": ("PN", "新采购下单", "人工"),
+    "PO_SIZE_GAP": ("PG", "尺码缺口：催PO/工厂直发/新采购", "人工"),
     "AD_THROTTLE": ("CT", "控速：下调活动预算", "API(需确认)"),
     "AD_BUDGET_UP": ("BU", "上调活动预算", "API(需确认)"),
     "AD_BID_UP": ("UP", "提高竞价", "API"),
@@ -95,6 +98,9 @@ def parent_flags(r, R):
     pr = _f(r.get("订单促销占比"))
     if pr is not None and pr > R["block_promo_share"]:
         block.append(f"订单促销占比={pr:.0%}>{R['block_promo_share']:.0%}")
+    ss_ = _f(r.get("尺码_缺货占需求比例"))
+    if ss_ is not None and ss_ >= R["size_block_share"]:
+        block.append(f"尺码级缺货占60天需求{ss_:.0%}(断码：{r.get('尺码_当前断码') or '-'})")
     thr = None
     pre = _f(r.get("空运可售前无法避免断货天数"))
     if pre is not None:
@@ -139,36 +145,45 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
             c["阻止原因"] = "父体有断货/库存风险，不得加投：" + "；".join(fl["block"] + ([fl["throttle"]] if fl["throttle"] else []))
         out.append(c)
 
-    # ---- 库存：空运/海运发货、采购
+    # ---- 库存：空运/海运发货、采购。有尺码级结果时以尺码级为准(亚马逊按子体判断缺货，尺码之间不能互相顶替)
     for key, r in info.items():
-        dmd = _f(r.get("日均7"))
+        dmd = _f(r.get("日均_预测")) or _f(r.get("日均7"))
         if not dmd:
             continue
-        air, sea = _f(r.get("建议空运件数")), _f(r.get("建议海运发货件数"))
         loc = _f(r.get("本地可用")) or 0
         pre = _f(r.get("空运可售前无法避免断货天数")) or 0
-        base = (f"日均7={dmd:.1f}，FBA可售={_f(r.get('FBA可售')) or 0:.0f}，本地可用={loc:.0f}；断货天数 保守/含待交付/全供给空运="
-                f"{_f(r.get('断货天数_保守')) or 0:.0f}/{_f(r.get('断货天数_含待交付')) or 0:.0f}/{_f(r.get('断货天数_全供给_空运')) or 0:.0f}")
-        small_air = air if (air and 0 < air < R["air_min_units"]) else 0
-        if air and air >= R["air_min_units"]:
-            short = _f(r.get("空运发货_本地仓不足件数")) or 0
-            lo14 = _f(r.get("建议空运件数_按14日均"))
-            lo = max(R["air_min_units"], lo14) if lo14 is not None else air      # 下限放到按14日均算的量：销量回落时不必空运这么多
-            s14 = ""
-            if lo14 is not None:
-                d14 = (_f(r.get("销量14")) or 0) / 14
-                s14 = f"；按14日均{d14:.1f}只需{lo14:.0f}件(空运量对销量假设敏感，近期是否持续放量需人工判断)"
-            add("INV_AIR_SHIP", key, 对象="本地仓→FBA 空运", 单位="件", 当前值=0, 建议值=air, 允许范围=[min(lo, air), math.ceil(air * 1.2)],
-                规则优先级="P0", _rank=1e6 + air,
-                依据=f"{base}；空运第{_f(r.get('空运可售_天后')) or 0:.0f}天可售，撑到海运可售第{_f(r.get('海运可售_天后')) or 0:.0f}天最少{air:.0f}件"
-                     + s14 + (f"；空运前仍断货{pre:.0f}天(需同时控速)" if pre else "") + (f"；本地仓不足{short:.0f}件" if short else "") + "；父体合计，需按尺码拆分")
-        if sea and sea > 0:
-            short = _f(r.get("海运发货_本地仓不足件数")) or 0
+        d7 = _f(r.get("日均_7天")) or _f(r.get("日均7"))
+        base = (f"日均_预测={dmd:.1f}(7/14/30/60天加权；近7天{d7 or 0:.1f})，FBA可售={_f(r.get('FBA可售')) or 0:.0f}，本地可用={loc:.0f}")
+        size = r.get("建议空运件数_尺码合计") is not None and _f(r.get("建议空运件数_尺码合计")) is not None
+        hi7 = _f(r.get("建议空运件数_按近7天日均"))
+        s7 = f"；若近7天日均{d7:.1f}持续，父体级估算需空运{hi7:.0f}件" if hi7 else ""
+        if size:
+            lost = _f(r.get("尺码_缺货件数_含待交付")) or 0
+            base += (f"；尺码级：当前断码{_f(r.get('尺码_当前断码数')) or 0:.0f}个({r.get('尺码_当前断码') or '-'})，"
+                     f"含待交付仍缺{lost:.0f}件(占60天需求{_f(r.get('尺码_缺货占需求比例')) or 0:.0%})，空运前无法避免缺{_f(r.get('尺码_空运前无法避免缺货件数')) or 0:.0f}件")
+            air, air_need = _f(r.get("空运_本地可发件数")) or 0, _f(r.get("建议空运件数_尺码合计")) or 0
+            sea, sea_need = _f(r.get("海运_本地可发件数")) or 0, _f(r.get("建议海运发货件数_尺码合计")) or 0
+            air_txt, sea_txt = r.get("空运尺码明细") or "", r.get("海运尺码明细") or ""
+            short_air, short_all = _f(r.get("尺码_空运本地不足件数")) or 0, _f(r.get("尺码_本地仓不足件数")) or 0
+        else:
+            air_need = air = _f(r.get("建议空运件数")) or 0
+            sea_need = sea = _f(r.get("建议海运发货件数")) or 0
+            air_txt = sea_txt = "父体合计，需按尺码拆分"
+            short_air, short_all = _f(r.get("空运发货_本地仓不足件数")) or 0, (_f(r.get("空运发货_本地仓不足件数")) or 0) + (_f(r.get("海运发货_本地仓不足件数")) or 0)
+        if air >= R["air_min_units"]:
+            add("INV_AIR_SHIP", key, 对象="本地仓→FBA 空运", 单位="件", 当前值=0, 建议值=air, 允许范围=[math.ceil(air * 0.8), math.ceil(air * 1.2)],
+                规则优先级="P0" if air >= 3 * R["air_min_units"] else "P1", _rank=1e6 + air,
+                依据=f"{base}；空运第{_f(r.get('空运可售_天后')) or 0:.0f}天可售，撑到海运可售第{_f(r.get('海运可售_天后')) or 0:.0f}天需{air_need:.0f}件，本地仓能发{air:.0f}件：{air_txt}"
+                     + s7 + (f"；空运前父体仍断货{pre:.0f}天(需同时控速)" if pre else ""))
+        if sea >= R["sea_min_units"]:
             add("INV_SEA_SHIP", key, 对象="本地仓→FBA 海运", 单位="件", 当前值=0, 建议值=sea, 允许范围=[sea, math.ceil(sea * 1.2)],
-                规则优先级="P1" if (_f(r.get("断货天数_含待交付")) or 0) > 0 else "P2", _rank=1e5 + sea,
-                依据=f"{base}；今天海运覆盖到第{_f(r.get('海运发货_覆盖至第N天')) or 0:.0f}天(含发货周期+安全库存)需{sea:.0f}件"
-                     + (f"；本地仓(先扣空运后)不足{short:.0f}件" if short else "")
-                     + (f"；海运可售前另缺{small_air:.0f}件(<{R['air_min_units']}件，不单独空运)" if small_air else "") + "；父体合计，需按尺码拆分")
+                规则优先级="P1" if (size and (_f(r.get("尺码_缺货件数_含待交付")) or 0) >= 1) or (_f(r.get("断货天数_含待交付")) or 0) > 0 else "P2", _rank=1e5 + sea,
+                依据=f"{base}；今天海运覆盖到第{_f(r.get('海运发货_覆盖至第N天')) or 0:.0f}天(含发货周期+安全库存)需{sea_need:.0f}件，本地仓能发{sea:.0f}件：{sea_txt}")
+        if short_all >= R["sea_min_units"]:
+            add("PO_SIZE_GAP", key, 对象="本地仓缺的尺码", 单位="件", 当前值=0, 建议值=short_all, 允许范围=[short_all, math.ceil(short_all * 1.3)],
+                规则优先级="P0" if short_air >= R["air_min_units"] else "P1", _rank=1e4 + short_all,
+                依据=f"{base}；本地仓对应尺码不够发 {short_all:.0f} 件(其中空运急需{short_air:.0f}件)：{r.get('尺码_本地仓不足明细') or '-'}；"
+                     "先查这些尺码有没有待交付PO可催/工厂直发，没有再新采购")
         late = _f(r.get("待交付_已过预计到货件数")) or 0
         if late > 0:
             add("PO_FOLLOWUP", key, 对象="工厂待交付PO", 单位="件", 当前值=late, 建议值=None,
@@ -457,7 +472,7 @@ def validate(sel, cands, cfg=None):
 def _action_txt(x):
     t = x["类型"]
     v = x.get("最终值")
-    if t in ("INV_AIR_SHIP", "INV_SEA_SHIP", "PO_NEW"):
+    if t in ("INV_AIR_SHIP", "INV_SEA_SHIP", "PO_NEW", "PO_SIZE_GAP"):
         return f"{x['类型名']} {v:.0f} 件" if v is not None else x["类型名"]
     if t == "PO_FOLLOWUP":
         return f"{x['类型名']}({x['当前值']:.0f} 件已过预计到货日)"
