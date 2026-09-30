@@ -33,7 +33,8 @@ DEFAULT_RULES = {
     "harvest_min_clicks": 5,         # 只有1~2次点击的"出单词"多是7天归因带来的，不收割
     "air_min_units": 10,             # 建议空运件数少于这个数不单独空运(并入海运)；>=3倍时规则优先级P0，否则P1
     "sea_min_units": 5,
-    "excess_min_units": 20,          # FBA冗余(或亚马逊冗余)>=此件数才列清货候选；本地滞销>=此件数才列停采/清仓
+    "excess_min_units": 20,
+    "aged_p1_units": 50,             # 卖出前会过181天库龄线的件数>=50(或已有过线库存、冗余仓储费>=$50)时清货为P1          # FBA冗余(或亚马逊冗余)>=此件数才列清货候选；本地滞销>=此件数才列停采/清仓
     "po_reduce_min_units": 10,
     "price_gap_check": 0.05,
     "price_floor_tol": 0.02,         # 促销价比保本价低超过2%才算亏本促销(保本价本身是估算)         # 实际售价(促销价优先)比竞品最低价高>=5% 才列核价候选              # 海运/尺码缺口少于这个数不单独列候选(随下一批一起处理)
@@ -223,8 +224,11 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
         ctx = (f"日均_预测={_f(r.get('日均_预测')) or 0:.1f}，FBA可售={_f(r.get('FBA可售')) or 0:.0f}；库龄91天以上{a91:.0f}件、181天以上{a181:.0f}件；"
                f"当前价{price or 0:.2f}、保本价{be_p or 0:.2f}")
         pp = [(m_, float(v_)) for m_, v_ in re.findall(r"([^、\s]+) ([\d.]+)", r.get("促销价明细") or "")]
-        if max(exf, amz) >= R["excess_min_units"]:
-            q = round(exf if exf >= R["excess_min_units"] else amz)
+        cross = _f(r.get("库龄_卖出前将满181天件数")) or 0
+        aged = _f(r.get("库龄_已满181天件数")) or 0
+        if max(exf, amz, cross + aged) >= R["excess_min_units"]:
+            base_q = max(exf, cross + aged)            # 已满181天的也要清
+            q = round(base_q if base_q >= R["excess_min_units"] else amz)   # 清货量取 冗余 与 卖出前会过库龄线 的较大者
             amz_txt = r.get("亚马逊建议促销明细") or ""
             low = ""
             if amz_txt and be_p:
@@ -232,8 +236,10 @@ def build_candidates(PL, K=None, S=None, AU=None, C=None, cfg=None, gmatch=None)
                 if ps and min(ps) < be_p:
                     low = f"；亚马逊建议价最低{min(ps):.2f}低于保本价{be_p:.2f}，不宜照做"
             add("INV_CLEAR", key, 对象="冗余尺码", 单位="件", 当前值=0, 建议值=q, 允许范围=[math.ceil(q * 0.5), math.ceil(q * 1.2)],
-                规则优先级="P1" if (a181 > 0 or sto >= 50) else "P2", _rank=5e3 + q, 父体概况=ctx,
-                依据=f"FBA在库冗余{exf:.0f}件(超{int((cfg or {}).get('excess_fba_days', 90))}天销量，不含在途)：{(r.get('冗余_FBA明细') or '-')[:160]}；亚马逊估算冗余{amz:.0f}件；"
+                规则优先级="P1" if (aged > 0 or cross >= R["aged_p1_units"] or sto >= 50) else "P2", _rank=5e3 + q, 父体概况=ctx,
+                依据=f"按先进先出，卖出前会满181天(开始收库龄附加费)的有{cross:.0f}件：{(r.get('库龄风险明细') or '-')[:140]}"
+                     + (f"；已满181天{aged:.0f}件" if aged else "")
+                     + f"；FBA在库冗余{exf:.0f}件(超{int((cfg or {}).get('excess_fba_days', 90))}天销量)；亚马逊估算冗余{amz:.0f}件；"
                      f"冗余部分下月仓储费约${sto:.0f}(按冗余件数分摊)"
                      + (f"；在途到货后再增加冗余{_f(r.get('冗余_在途将增加件数')):.0f}件，这些尺码可暂停发货" if (_f(r.get('冗余_在途将增加件数')) or 0) >= 5 else "") + low
                      + (f"；已有{len(pp)}个尺码在促销(最低{min(v_ for _, v_ in pp):.2f})，先看促销效果再加码" if pp else "") + "；促销价不得低于保本价")
