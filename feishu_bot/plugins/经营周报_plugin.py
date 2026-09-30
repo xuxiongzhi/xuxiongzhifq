@@ -187,17 +187,42 @@ def _ws_config(ws: dict) -> str:
     return p
 
 
+def _log(msg: str, level: str = "info"):
+    """控制台(店铺后端 cmd 窗口)日志，统一前缀 [经营周报]"""
+    getattr(logging, level)(f"[经营周报] {msg}")
+
+
+_STEP_NAMES = {"recognize.py": "识别", "window": "窗口", "ingest": "合并", "pack": "数据包"}
+
+
 def _run(args: list, timeout: int, log_name: str) -> tuple[int, str]:
-    """子进程运行；stdout+stderr 追加到 logs/；返回 (退出码, 输出)"""
+    """子进程运行：输出逐行实时打印到控制台，同时追加到 logs/<log_name>；超时强制结束。返回 (退出码, 全部输出)"""
+    step = next((v for k, v in _STEP_NAMES.items() if k in args[0] or k in args), os.path.basename(args[0]))
+    t0 = time.time()
+    _log(f"[{step}] 开始：{os.path.basename(args[0])} {' '.join(a for a in args[1:] if not os.path.isabs(a))}")
+    lines, code = [], -1
     try:
-        proc = subprocess.run([sys.executable] + args, cwd=ENGINE_DIR, env=_env(), capture_output=True,
-                              text=True, encoding="utf-8", errors="replace", timeout=timeout)
-        out = (proc.stdout or "") + ("\n[stderr]\n" + proc.stderr if proc.stderr else "")
-        code = proc.returncode
-    except subprocess.TimeoutExpired as e:
-        out, code = f"超时(>{timeout}秒)\n{e.stdout or ''}", -9
+        proc = subprocess.Popen([sys.executable, "-u"] + args, cwd=ENGINE_DIR, env=_env(), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
+        killer = threading.Timer(timeout, proc.kill)
+        killer.start()
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                lines.append(line)
+                show = re.sub(r"\s{2,}", "  ", line.strip())          # 表格对齐用的长空格压缩掉
+                if show and not show.startswith("{"):                # 识别器给插件用的 JSON 不打印
+                    _log(f"[{step}] {show[:300]}")
+            code = proc.wait()
+        finally:
+            killer.cancel()
+        if time.time() - t0 >= timeout:
+            code = -9
+            lines.append(f"超时(>{timeout}秒)，已强制结束")
     except Exception as e:
-        out, code = f"启动失败：{e}", -1
+        lines.append(f"启动失败：{e}")
+    out = "\n".join(lines)
+    _log(f"[{step}] 结束：exit {code}，用时 {time.time() - t0:.0f} 秒", "info" if code == 0 else "error")
     try:
         with open(os.path.join(LOG_DIR, log_name), "a", encoding="utf-8") as f:
             f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {' '.join(os.path.basename(a) for a in args[:2])} "
@@ -297,23 +322,25 @@ def handle(message_id: str, text: str, reply_fn, user_id: str | None = None) -> 
     elif sub == "定时":
         reply_fn(message_id, _sched_cmd(arg))
     elif sub == "测试":
-        _start(message_id, reply_fn, "测试", arg, _latest_test_week(), exclusive=True)
+        _start(message_id, reply_fn, "测试", arg, _latest_test_week(), exclusive=True, user_id=user_id)
     elif sub in ("窗口", "导入", "检查", "生成", "AI", "ai", "发送"):
         _start(message_id, reply_fn, sub.upper() if sub.lower() == "ai" else sub, arg, _default_week_end(),
-               exclusive=sub in ("导入", "生成", "AI", "ai"))
+               exclusive=sub in ("导入", "生成", "AI", "ai"), user_id=user_id)
     else:
         reply_fn(message_id, "用法：\n" + "\n".join(HELP_DETAIL))
     return True
 
 
-def _start(message_id, reply_fn, name, arg, default_week, exclusive=True):
+def _start(message_id, reply_fn, name, arg, default_week, exclusive=True, user_id=None):
     week_end, err = _parse_week(arg, default_week)
     if err:
         tip = "；测试文件请放进 weekly_report/test/inputs/<周结束日>/" if name == "测试" and not default_week else ""
         reply_fn(message_id, f"❌ {err}{tip}")
         return
+    _log(f"收到指令：{name} {week_end}(用户 {user_id or '定时'}，消息 {message_id})")
     if exclusive:
         if not _run_lock.acquire(blocking=False):
+            _log(f"已有任务在运行({_running['task']})，拒绝本次 {name}", "warning")
             reply_fn(message_id, f"⏳ 已有周报任务在运行：{_running['task']}(开始于 {_running['since']})，请稍后再试")
             return
         _running.update(task=f"{name} {week_end}", since=datetime.now().strftime("%H:%M:%S"))
@@ -324,7 +351,7 @@ def _start(message_id, reply_fn, name, arg, default_week, exclusive=True):
         try:
             fn(message_id, reply_fn, week_end)
         except Exception as e:
-            logging.exception(f"[周报] {name} 异常")
+            logging.exception(f"[经营周报] {name} 异常")
             reply_fn(message_id, f"❌ 周报{name}异常：{type(e).__name__}: {e}")
         finally:
             if exclusive:
@@ -343,12 +370,18 @@ def _import(ws: dict, src: str, week_end: str, copy: bool) -> tuple[dict | None,
     if copy:
         args.append("--copy")
     code, out = _run(args, 600, "recognize.log")
-    return _load_manifest(ws, week_end), out
+    man = _load_manifest(ws, week_end)
+    if man:
+        _log(f"[识别] 识别到 {len(man.get('files', {}))} 类报表：{'、'.join(v['name'] for v in man.get('files', {}).values())}；"
+             f"SP-API缓存 {len(man.get('spapi_cache', []))} 份；"
+             + (f"缺必需：{'、'.join(man['missing_required'])}" if man.get("missing_required") else "必需文件齐全"))
+    return man, out
 
 
 def _build(ws: dict, week_end: str) -> tuple[bool, str]:
     """合并数据(ingest) + 生成AI数据包(pack)。返回 (成功, 错误信息)"""
     cfg = _ws_config(ws)
+    _log(f"[合并] 工作区：{'测试(只用SP-API缓存)' if ws['cache_only'] else '正式(会请求SP-API，最长约40分钟)'}；输出目录 {ws['out']}")
     args = [SCRIPT, "--config", cfg, "ingest", "--inputs", os.path.join(ws["root"], "raw", week_end), "--week-end", week_end]
     if ws["cache_only"]:
         args.append("--spapi-cache-only")
@@ -378,13 +411,26 @@ def _prev_actions(ws: dict, week_end: str) -> tuple[str, str]:
     return prev_we, _sec(md, "八、", "九、") or _sec(md, "A[.．、]", "B[.．、]")
 
 
-def _call_ai(prompt: str) -> tuple[str | None, str]:
+def _call_ai(prompt: str, label: str = "AI") -> tuple[str | None, str]:
+    """调用 ai_runner；等待期间每30秒打印一次心跳，结束打印用时与字数"""
+    t0, done = time.time(), threading.Event()
+    _log(f"[{label}] 提交模型：输入 {len(prompt):,} 字符，等待回复…")
+
+    def _beat():
+        while not done.wait(30):
+            _log(f"[{label}] 仍在等待模型回复，已等 {time.time() - t0:.0f} 秒")
+    threading.Thread(target=_beat, daemon=True, name="周报-AI心跳").start()
     try:
         text = (ai_runner.run_ai(prompt, timeout=AI_TIMEOUT) or "").strip()
     except Exception as e:
+        _log(f"[{label}] 调用失败：{e}", "error")
         return None, f"AI 调用失败：{e}"
+    finally:
+        done.set()
     if not text or text.startswith("❌"):
+        _log(f"[{label}] 调用失败：{text[:300] or '空回复'}", "error")
         return None, f"AI 调用失败：{text[:300] or '空回复'}"
+    _log(f"[{label}] 完成：输出 {len(text):,} 字符，用时 {time.time() - t0:.0f} 秒")
     return text, ""
 
 
@@ -398,16 +444,18 @@ def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
         return None, "没有找到该周的AI数据包，请先生成数据"
     with open(pack, "r", encoding="utf-8") as f:
         data = f.read()
+    _log(f"[AI] 使用数据包 {os.path.basename(pack)}；分两次调用：①数据报告 ②执行建议")
     part1, err = _call_ai(data + "\n\n---\n# 本次任务\n只输出**第一部分 数据报告**：第一行 `# 亚马逊周报 " + week_end
-                          + "`，然后按 一~七 写；不要输出第二部分。严格遵守第一原则(没有的数据写'无数据')。全文约4500字以内，表格优先，不复述数据包原文。")
+                          + "`，然后按 一~七 写；不要输出第二部分。严格遵守第一原则(没有的数据写'无数据')。全文约4500字以内，表格优先，不复述数据包原文。", "AI①数据报告")
     if not part1:
         return None, err
     prev_we, prev = _prev_actions(ws, week_end)
+    _log(f"[AI] 上周({prev_we})执行建议：{'已附上，供第十二节复盘' if prev else '没有，第十二节写无'}")
     prev_block = (f"\n\n---\n# 上周({prev_we})AI周报的执行建议清单(供 十二 节逐条评估；无法确认是否执行的写'未知')\n{prev}\n"
                   if prev else "\n\n(没有上周的AI周报，十二 节写'无')\n")
     part2, err = _call_ai(data + "\n\n---\n# 已写好的第一部分(数据报告)\n" + part1 + prev_block
                           + "\n---\n# 本次任务\n只输出**第二部分 执行建议**：以 `## 第二部分 执行建议` 开头，按 八~十二 写。"
-                          "每条建议的数字必须与数据包和第一部分一致；不要重复第一部分的内容。约3500字以内。")
+                          "每条建议的数字必须与数据包和第一部分一致；不要重复第一部分的内容。约3500字以内。", "AI②执行建议")
     if not part2:
         return None, "第一部分已生成，但" + err
     notes = []
@@ -420,6 +468,7 @@ def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
             f"工作区：{'测试' if ws is WS['测试'] else '正式'} -->\n")
     with open(path, "w", encoding="utf-8") as f:
         f.write(head + part1 + "\n\n" + part2 + "\n")
+    _log(f"[AI] 周报原稿已保存：{path}" + (f"；注意：{'；'.join(notes)}" if notes else ""))
     return path, ("⚠️ " + "；".join(notes)) if notes else ""
 
 
@@ -482,21 +531,29 @@ def _finish(ws, week_end, reply_fn, message_id, chat_id, t0) -> None:
     reply_fn(message_id, "🧠 数据已生成，AI 正在撰写周报…")
     path, note = _ai_report(ws, week_end)
     if not path:
+        _log(f"❌ AI 周报失败：{note}", "error")
         reply_fn(message_id, f"❌ {note}\n(周宽表与数据包已保存在 {ws['out']})")
         return
     send = path
+    t1 = time.time()
+    _log("[PDF] 转换中(Markdown → HTML → 浏览器打印 PDF)…")
     try:
         send = _to_pdf(path)
+        _log(f"[PDF] 完成：{send}（{os.path.getsize(send) // 1024} KB，{time.time() - t1:.0f} 秒）")
     except Exception as e:
-        logging.warning(f"[周报] 转 PDF 失败：{e}")
+        _log(f"[PDF] 转换失败，改发 Markdown：{e}", "warning")
         note = (note + "\n" if note else "") + f"⚠️ 转 PDF 失败，改发 Markdown：{str(e)[:150]}"
     try:
+        _log(f"[发送] 上传并发送 {os.path.basename(send)} → {'群 ' + chat_id if chat_id else '回复消息 ' + message_id}")
         _send_file(send, message_id=message_id, chat_id=chat_id)
+        _log("[发送] 成功")
     except Exception as e:
+        _log(f"[发送] 失败：{e}", "error")
         note = (note + "\n" if note else "") + f"⚠️ 周报文件发送失败：{e}(文件在 {send})"
     _write_state({f"last_{'test' if ws is WS['测试'] else 'formal'}": {
         "week_end": week_end, "at": datetime.now().strftime("%Y-%m-%d %H:%M"), "report": os.path.basename(path)}})
     reply_fn(message_id, _overview(ws, week_end, path, note, int(time.time() - t0), sent=send))
+    _log(f"✅ 完成：{week_end} 周报已发送并附概述，总用时 {time.time() - t0:.0f} 秒")
 
 
 def _do_test(message_id, reply_fn, week_end):

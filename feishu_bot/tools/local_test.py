@@ -31,6 +31,8 @@ def _fake_ai(prompt, timeout=600, model=None):
 
 
 def main(cmds):
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)   # 与店铺后端控制台同格式
     sys.modules["config"] = types.SimpleNamespace(CHAT_ID="oc_test_chat", STORE_NAME="店铺A", GATEWAY_BASE_URL="http://127.0.0.1:8000")
     sys.modules["feishu_gateway"] = types.SimpleNamespace(
         APP_ID="x", APP_SECRET="x", send_to_chat=lambda c, t: print(f"\n[推送到群 {c}] {t}"),
