@@ -915,6 +915,10 @@ def _run_reports(client, specs, cfg, label="", deadline=None):
             out[sp["name"]] = ("CACHE", Path(cp).read_bytes())
             log(f"{tag} 命中缓存，跳过请求")
             continue
+        if client is None:                   # 仅缓存模式(--spapi-cache-only)：不调用亚马逊
+            out[sp["name"]] = ("ERROR", "仅缓存模式：本地没有该报告的缓存，未请求亚马逊")
+            log(f"{tag} 仅缓存模式且无缓存，跳过")
+            continue
         rid = None
         if not refresh and os.path.exists(ridf):
             try:
@@ -1446,12 +1450,17 @@ def _fetch_store(store, code, client, L_store, week_end, cfg, q, deadline=None, 
 
 def fetch_spapi_parent_weekly(L, week_end, cfg, q):   # 返回 (父体SP数据, SQP, 周度销量历史)
     """返回 (父体级SP数据 DataFrame|None, SQP父体×搜索词 DataFrame|None)。每个店铺(卖家账号×站点)独立拉取。"""
-    if not SPAPI_IMPORT_OK:
+    cache_only = bool(cfg.get("spapi_cache_only"))
+    if not SPAPI_IMPORT_OK and not cache_only:
         q.add("WARN", "SP-API库", "未安装 python-amazon-sp-api(pip install python-amazon-sp-api)：本次跳过在线拉取")
         return None, None, None
     SP_DAILY.clear()
     stores = sorted(set(str(x).strip() for x in L["店铺"].dropna().unique()))
-    accounts = _resolve_accounts(cfg, stores, q)
+    if cache_only:
+        q.add("INFO", "SP-API仅缓存模式", f"只读取 {cfg.get('spapi_cache_dir')} 里已有的报告，不请求亚马逊；没有缓存的报告按缺失处理")
+        accounts = {s_: (None, None, "cache") for s_ in stores}
+    else:
+        accounts = _resolve_accounts(cfg, stores, q)
     if not accounts:
         return None, None, None
     frames, sqps, hists, clients = [], [], [], {}
@@ -1478,7 +1487,7 @@ def fetch_spapi_parent_weekly(L, week_end, cfg, q):   # 返回 (父体SP数据, 
         log(f"{label} 开始")
         try:
             if key not in clients:
-                clients[key] = _build_reports_client(creds, refresh, code)
+                clients[key] = None if cache_only else _build_reports_client(creds, refresh, code)
             base = L[L["店铺"] == store].copy()
             if base.empty:
                 continue
@@ -2080,6 +2089,8 @@ def cmd_window(a, cfg):
         print("  " + l)
     print("\n领星请这样下载：")
     print(f"  · 广告各报表(活动/广告组/推广商品/广告位/关键词/自动投放/用户搜索)：日期选 {s0} ~ {e0}")
+    print(f"  · 订单导出：订购日期选 {s0} ~ {e0}(销量/销售额按此窗口计算，必须完整覆盖)")
+    print("  · FBA货件、补货建议(父Asin)：快照，与 Listing 同一天导出(断货模拟从该日起算)")
     print("  · Listing / 补货建议 / 成本表：库存是快照，当天导出即可；其中的'7日销量'是滚动窗口(截止导出日)，与上面日期不完全重合，只作参考")
     print(f"  · 放进文件夹 inputs/{we} 后运行：python weekly_pipeline_spapi.py ingest --inputs inputs/{we}")
     if not aligned:
@@ -2149,6 +2160,8 @@ def cmd_ingest(a, cfg):
         cfg["spapi_refresh"] = True
     if getattr(a, "no_spapi", False):
         cfg["spapi_enabled"] = False
+    if getattr(a, "spapi_cache_only", False):
+        cfg["spapi_cache_only"] = True
     if getattr(a, "sp_wait", None) is not None:
         cfg["spapi_report_timeout_seconds"] = int(a.sp_wait)
     if cfg.get("spapi_enabled", True):
@@ -2724,6 +2737,7 @@ def main():
     i = sub.add_parser("ingest"); i.add_argument("--inputs", required=True); i.add_argument("--week-end")
     i.add_argument("--refresh-spapi", action="store_true", help="忽略SP-API缓存，重新拉取")
     i.add_argument("--no-spapi", action="store_true", help="本次不在线拉取SP-API")
+    i.add_argument("--spapi-cache-only", action="store_true", help="只用 spapi_cache_dir 里已下载的报告，不请求亚马逊(离线测试用)")
     i.add_argument("--sp-wait", type=int, default=None, help="SP-API 单份报告最多等多少秒；0=只提交不等待(报告留待下次运行取回)")
     w = sub.add_parser("window", help="只打印本次各数据源的时间窗口，方便按同样日期去领星下载"); w.add_argument("--week-end")
     p = sub.add_parser("pack"); p.add_argument("--weeks", type=int, default=4); p.add_argument("--end")

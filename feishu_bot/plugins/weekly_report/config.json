@@ -38,8 +38,8 @@
   "spapi_enabled": true,
   "spapi_credential_file": "",
   "spapi_accounts": {
-    "tangliuquan": "亚马逊sp-api.txt",
-    "xupeng": "亚马逊sp-api-xupeng.txt"
+    "tangliuquan": "../../ziliao/亚马逊sp-api.txt",
+    "xupeng": "../../ziliao/亚马逊sp-api-xupeng.txt"
   },
   "spapi_single_account": "",
   "spapi_poll_seconds": 15,
