@@ -55,7 +55,7 @@ HELP_DETAIL = [
     "/周报 检查 [日期]    检查该周文件是否齐全、订单是否覆盖整周",
     "/周报 生成 [日期]    正式生成：拉SP-API→合并→AI周报→发文件+概述",
     "/周报 AI [日期]      只重跑AI周报(数据已生成时)，发文件+概述",
-    "/周报 发送 [日期]    重发该周的AI周报文件",
+    "/周报 发送 [日期]    重发该周的AI周报(PDF)",
     "/周报 绑定          定时周报推送到本群",
     "/周报 定时 开启|关闭  每周五13:00(北京时间)自动跑上一周",
 ]
@@ -63,7 +63,8 @@ HELP_DETAIL = [
 HELP_TIPS = [
     "💡 日期=周结束日(周六)；正式指令不填则取最近一个数据已发布的周六，测试指令不填则取测试文件夹里最新的一周",
     "💡 测试文件放 weekly_report/test/inputs/<周结束日>/，文件名随意，按表头识别",
-    "💡 群里只发AI最终周报；周宽表、数据包保存在 out/ 备查",
+    "💡 群里只发AI最终周报(PDF)；Markdown原稿、周宽表、数据包保存在 out/ 备查",
+    "💡 PDF 用本机 Chrome/Edge 生成(需 pip install markdown)；转换失败会改发 Markdown 并提示原因",
 ]
 
 # ── 路径与参数 ─────────────────────────────────────────────────
@@ -422,7 +423,7 @@ def _ai_report(ws: dict, week_end: str) -> tuple[str | None, str]:
     return path, ("⚠️ " + "；".join(notes)) if notes else ""
 
 
-def _overview(ws: dict, week_end: str, report: str, note: str, secs: int) -> str:
+def _overview(ws: dict, week_end: str, report: str, note: str, secs: int, sent: str = "") -> str:
     """结束概述：店铺汇总 + 断货风险数 + 本周执行清单前3条"""
     import pandas as pd
     lines = [f"📊 亚马逊周报 {week_end}（周窗口 {(datetime.strptime(week_end, '%Y-%m-%d') - timedelta(days=6)):%m-%d}~{week_end[5:]}）"
@@ -463,24 +464,39 @@ def _overview(ws: dict, week_end: str, report: str, note: str, secs: int) -> str
         pass
     if note:
         lines.append(note)
-    lines.append(f"完整周报见附件 {os.path.basename(report)}；用时 {secs // 60} 分 {secs % 60} 秒")
+    lines.append(f"完整周报见附件 {os.path.basename(sent or report)}；用时 {secs // 60} 分 {secs % 60} 秒")
     return "\n".join(lines)
 
 
+def _to_pdf(md_path: str) -> str:
+    """周报 .md → .html + .pdf(weekly_report/render_pdf.py，用本机 Chrome/Edge 打印)。失败抛异常"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("wr_render_pdf", os.path.join(ENGINE_DIR, "render_pdf.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.md_file_to_pdf(md_path)
+
+
 def _finish(ws, week_end, reply_fn, message_id, chat_id, t0) -> None:
-    """AI 周报 → 发文件 → 概述"""
+    """AI 周报(.md 保存) → 转 PDF → 发 PDF(失败则发 .md) → 概述"""
     reply_fn(message_id, "🧠 数据已生成，AI 正在撰写周报…")
     path, note = _ai_report(ws, week_end)
     if not path:
         reply_fn(message_id, f"❌ {note}\n(周宽表与数据包已保存在 {ws['out']})")
         return
+    send = path
     try:
-        _send_file(path, message_id=message_id, chat_id=chat_id)
+        send = _to_pdf(path)
     except Exception as e:
-        note = (note + "\n" if note else "") + f"⚠️ 周报文件发送失败：{e}(文件在 {path})"
+        logging.warning(f"[周报] 转 PDF 失败：{e}")
+        note = (note + "\n" if note else "") + f"⚠️ 转 PDF 失败，改发 Markdown：{str(e)[:150]}"
+    try:
+        _send_file(send, message_id=message_id, chat_id=chat_id)
+    except Exception as e:
+        note = (note + "\n" if note else "") + f"⚠️ 周报文件发送失败：{e}(文件在 {send})"
     _write_state({f"last_{'test' if ws is WS['测试'] else 'formal'}": {
         "week_end": week_end, "at": datetime.now().strftime("%Y-%m-%d %H:%M"), "report": os.path.basename(path)}})
-    reply_fn(message_id, _overview(ws, week_end, path, note, int(time.time() - t0)))
+    reply_fn(message_id, _overview(ws, week_end, path, note, int(time.time() - t0), sent=send))
 
 
 def _do_test(message_id, reply_fn, week_end):
@@ -536,6 +552,13 @@ def _do_resend(message_id, reply_fn, week_end):
     for ws in (WS["正式"], WS["测试"]):
         p = _report_path(ws, week_end)
         if os.path.exists(p):
+            pdf = os.path.splitext(p)[0] + ".pdf"
+            if not os.path.exists(pdf) or os.path.getmtime(pdf) < os.path.getmtime(p):
+                try:
+                    pdf = _to_pdf(p)
+                except Exception:
+                    pdf = ""
+            p = pdf if pdf and os.path.exists(pdf) else p
             try:
                 _send_file(p, message_id=message_id)
             except Exception as e:
