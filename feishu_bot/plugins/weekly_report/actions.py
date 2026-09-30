@@ -699,7 +699,9 @@ def lint_report(text, P):
                     issues.append(f"「{c.strip()[:80]}」把库存状态=紧张的 {'、'.join(bad)} 和'偏多'写在一起")
     # 2b) "断码"只能指当前可售为0的尺码
     if "尺码_当前断码" in P.columns:
-        cur = {str(k): str(v) for k, v in zip(P["款"], P["尺码_当前断码"].fillna(""))}
+        cur = {}
+        for k, v in zip(P["款"], P["尺码_当前断码"].fillna("")):     # 同款可能在多个店铺(US/UK)，合并各店铺的断码
+            cur[str(k)] = (cur.get(str(k), "") + " " + str(v)).strip()
         for c in clauses:
             if "断码" not in c:
                 continue
